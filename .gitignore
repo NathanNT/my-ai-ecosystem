@@ -1,0 +1,78 @@
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+*secret*
+*secrets*
+*token*
+*tokens*
+*credential*
+*credentials*
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+
+# OpenCLAW local state and real configuration
+.openclaw/
+openclaw.json
+openclaw.json.bak*
+openclaw.json.last-good
+*.attested
+
+# Runtime data
+*.log
+logs/
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+runtime/
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+ENV/
+
+# Node and package manager caches
+node_modules/
+.npm/
+.pnpm-store/
+
+# IDEs and editors
+.idea/
+.vscode/
+*.code-workspace
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local artifacts
+dist/
+build/
+out/
+artifacts/
+exports/

@@ -1,0 +1,128 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "%USERPROFILE%\\.openclaw\\workspace",
+      "model": {
+        "primary": "vllm/qwen36-27b"
+      },
+      "models": {
+        "vllm/qwen36-27b": {
+          "params": {
+            "maxTokens": 2048
+          }
+        }
+      },
+      "compaction": {
+        "reserveTokensFloor": 0,
+        "reserveTokens": 2048,
+        "truncateAfterCompaction": true
+      },
+      "params": {
+        "maxTokens": 2048
+      },
+      "bootstrapMaxChars": 2000,
+      "bootstrapTotalMaxChars": 4000,
+      "contextInjection": "never",
+      "skills": []
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token",
+      "token": "${OPENCLAW_GATEWAY_TOKEN}"
+    },
+    "port": 18789,
+    "bind": "loopback",
+    "tailscale": {
+      "mode": "off",
+      "resetOnExit": false
+    }
+  },
+  "session": {
+    "dmScope": "per-channel-peer"
+  },
+  "tools": {
+    "profile": "minimal",
+    "alsoAllow": [
+      "group:runtime"
+    ]
+  },
+  "plugins": {
+    "entries": {
+      "vllm": {
+        "enabled": true
+      },
+      "telegram": {
+        "enabled": true
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "vllm": {
+        "baseUrl": "${VLLM_BASE_URL}",
+        "api": "openai-completions",
+        "apiKey": "VLLM_API_KEY",
+        "models": [
+          {
+            "id": "qwen36-27b",
+            "name": "qwen36-27b",
+            "reasoning": false,
+            "input": [
+              "text"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 131072,
+            "maxTokens": 2048,
+            "contextTokens": 131072
+          }
+        ]
+      }
+    }
+  },
+  "auth": {
+    "profiles": {
+      "vllm:default": {
+        "provider": "vllm",
+        "mode": "api_key"
+      }
+    }
+  },
+  "skills": {
+    "install": {
+      "nodeManager": "npm"
+    },
+    "limits": {
+      "maxSkillsPromptChars": 0
+    }
+  },
+  "hooks": {
+    "internal": {
+      "entries": {
+        "session-memory": {
+          "enabled": false
+        }
+      }
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "botToken": "${TELEGRAM_BOT_TOKEN}",
+      "historyLimit": 0,
+      "dmHistoryLimit": 0
+    }
+  },
+  "commands": {
+    "ownerAllowFrom": [
+      "telegram:<owner-chat-id>"
+    ]
+  }
+}
