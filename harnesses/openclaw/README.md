@@ -107,6 +107,28 @@ openclaw status --deep
 openclaw gateway probe
 ```
 
+### Launch OpenCLAW
+
+For the current local setup, run the Gateway in the foreground:
+
+```powershell
+openclaw gateway run --force
+```
+
+This uses the configured local Gateway port (`18789` in the current setup). Keep this terminal open while OpenCLAW is running.
+
+If the Gateway is later installed as a Windows service, use:
+
+```powershell
+openclaw gateway start
+```
+
+Check the result with:
+
+```powershell
+openclaw gateway status
+```
+
 Only start, stop, restart, or install services intentionally. For a future restore workflow, prefer documenting the exact command sequence before automating it.
 
 ## Runpod And vLLM Notes
@@ -136,15 +158,23 @@ The local OpenCLAW config and backups may contain:
 
 Treat `%USERPROFILE%\.openclaw` as private machine state. This repository should only contain sanitized examples and restore notes.
 
-## Future OpenLIT Integration
+## Monitoring Direction
 
-OpenLIT should observe usage around the vLLM/OpenAI-compatible endpoint without storing secrets in this repository.
+For this Windows setup, Runpod lifecycle scripts are the preferred local control plane. Keep monitoring and machine control notes under:
 
-The likely integration points are:
+```text
+monitoring/runpod/
+```
 
-- vLLM server metrics on the Runpod pod;
-- OpenAI-compatible request/response telemetry;
-- token usage and latency by model;
-- Runpod GPU cost and pod runtime tracking.
+The first monitoring target should be client-side traces for OpenAI-compatible calls going from Windows/OpenCLAW to the Runpod vLLM endpoint.
 
-Keep OpenLIT configuration under `monitoring/openlit/` and keep OpenCLAW-specific harness notes here.
+### Runpod Control Center
+
+From the repository root, start the local dashboard that groups pods, templates, and vLLM/ASR deployments:
+
+```powershell
+$env:RUNPOD_API_KEY = "<ta_runpod_api_key>"
+streamlit run monitoring/runpod/dashboard/app.py
+```
+
+Then open `http://localhost:8501`. The key can also be entered in the sidebar and saved to the Windows user environment with `Enregistrer la clé dans Windows`.

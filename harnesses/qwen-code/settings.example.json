@@ -1,0 +1,21 @@
+{
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "qwen36-27b",
+        "name": "Qwen 3.6 27B via RunPod vLLM",
+        "description": "The Qwen coding model served by the RunPod vLLM pod.",
+        "envKey": "VLLM_API_KEY",
+        "baseUrl": "https://<pod-id>-8000.proxy.runpod.net/v1",
+        "generationConfig": {
+          "timeout": 300000,
+          "contextWindowSize": 131072,
+          "samplingParams": {
+            "temperature": 0.2,
+            "max_tokens": 4096
+          }
+        }
+      }
+    ]
+  }
+}

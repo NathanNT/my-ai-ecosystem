@@ -1,0 +1,16 @@
+{
+  "_note": "Replace this with a valid Runpod create payload for your account and region.",
+  "name": "my-a40-vllm",
+  "cloudType": "SECURE",
+  "gpuTypeId": "<runpod-gpu-type-id-or-name>",
+  "networkVolumeId": "<optional-network-volume-id>",
+  "containerDiskInGb": 120,
+  "containerDiskType": "AUTO",
+  "imageName": "<docker-image>",
+  "minVCPU": 2,
+  "minMemoryInGb": 4,
+  "env": {
+    "MODEL_NAME": "qwen2.5-32b-instruct"
+  },
+  "ports": "8888/http,22/tcp"
+}
