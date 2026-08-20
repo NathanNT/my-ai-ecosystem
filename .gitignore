@@ -76,3 +76,6 @@ build/
 out/
 artifacts/
 exports/
+
+# Local Streamlit secrets
+.streamlit/secrets.toml

@@ -6,6 +6,7 @@ Resources for setting up my hybrid AI ecosystem, combining local models and mode
 
 - `skills/`: reusable skills shared across agent harnesses.
 - `harnesses/`: harness-specific configuration and instructions.
+- `harnesses/qwen-code/`: Qwen Code setup for the RunPod vLLM infrastructure.
 - `mcp/`: MCP-related resources and configuration examples.
 - `monitoring/`: future usage, GPU, and cost tracking resources.
 - `scripts/`: Windows-first PowerShell scripts and portable Python automation.

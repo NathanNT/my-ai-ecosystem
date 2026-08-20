@@ -1,0 +1,33 @@
+{
+  "_note": "Template de référence pour une API de transcription audio compatible OpenAI. Génère une clé unique avant déploiement.",
+  "serviceType": "asr",
+  "name": "vllm-whisper-asr",
+  "cloudType": "SECURE",
+  "gpuCount": 1,
+  "gpuTypeIds": [
+    "NVIDIA A40"
+  ],
+  "imageName": "vllm/vllm-openai:latest",
+  "containerDiskInGb": 30,
+  "volumeInGb": 50,
+  "volumeMountPath": "/workspace",
+  "ports": [
+    "8000/http"
+  ],
+  "env": {
+    "MODEL_ID": "openai/whisper-large-v3-turbo",
+    "HF_HOME": "/workspace/huggingface",
+    "VLLM_API_KEY": "<generate-a-secret>",
+    "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB": "25"
+  },
+  "dockerStartCmd": [
+    "--model",
+    "openai/whisper-large-v3-turbo",
+    "--host",
+    "0.0.0.0",
+    "--port",
+    "8000",
+    "--api-key",
+    "<same-secret-as-VLLM_API_KEY>"
+  ]
+}
