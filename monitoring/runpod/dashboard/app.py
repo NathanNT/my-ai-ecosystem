@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import html
 import json
 import os
@@ -11,7 +12,9 @@ import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,15 +22,51 @@ from typing import Any
 import requests
 import streamlit as st
 
+try:
+    import psutil
+except ImportError:  # Keep the dashboard usable while setup repairs the environment.
+    psutil = None
+
+# Streamlit and its test runner do not always add the script directory to sys.path.
+_DASHBOARD_DIR = str(Path(__file__).resolve().parent)
+if _DASHBOARD_DIR not in sys.path:
+    sys.path.insert(0, _DASHBOARD_DIR)
+
+from lifecycle import (
+    clear_policy,
+    load_policy_store,
+    mark_completed,
+    mark_error,
+    parse_timestamp,
+    pod_policy_action,
+    policy_lock,
+    save_policy_store,
+    schedule_policy,
+    utc_now,
+)
+from connections import (
+    connection_slug,
+    load_connection_store,
+    openclaw_model_ref,
+    openclaw_provider_config,
+    openclaw_provider_id,
+    remove_connection,
+    save_connection_store,
+    upsert_connection,
+)
+
 
 RUNPOD_DIR = Path(__file__).resolve().parents[1]
 TEMPLATES_DIR = RUNPOD_DIR / "templates"
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+LIFECYCLE_POLICIES_PATH = RUNPOD_DIR / "data" / "pod-lifecycle.json"
+VLLM_CONNECTIONS_PATH = RUNPOD_DIR / "data" / "vllm-connections.json"
 DEFAULT_API_BASE_URL = "https://rest.runpod.io/v1"
 VLLM_PORT = 8000
 ACTIVE_POD_STATES = {"RUNNING", "READY", "STARTING", "CREATING"}
 OPENCLAW_CONFIG_PATH = Path.home() / ".openclaw" / "openclaw.json"
 QWEN_CONFIG_PATH = Path.home() / ".qwen" / "settings.json"
+_OPENCLAW_AUTH_PROFILE_FINGERPRINT = ""
 SENSITIVE_CONFIG_WORDS = {
     "apikey",
     "api_key",
@@ -188,6 +227,75 @@ def response_items(response: Any) -> list[dict[str, Any]]:
     return []
 
 
+def credential_fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest() if value else "anonymous"
+
+
+@st.cache_data(ttl=15, max_entries=8, show_spinner=False)
+def cached_runpod_pods(
+    base_url: str,
+    api_key_fingerprint: str,
+    _api_key: str,
+) -> list[dict[str, Any]]:
+    del api_key_fingerprint
+    return response_items(request_runpod("GET", base_url, _api_key, "/pods"))
+
+
+@st.cache_data(ttl=60, max_entries=8, show_spinner=False)
+def cached_runpod_account(
+    api_key_fingerprint: str,
+    _api_key: str,
+) -> dict[str, Any]:
+    del api_key_fingerprint
+    return request_account_summary(_api_key)
+
+
+@st.cache_data(ttl=300, max_entries=8, show_spinner=False)
+def cached_runpod_billing(
+    base_url: str,
+    api_key_fingerprint: str,
+    _api_key: str,
+) -> list[dict[str, Any]]:
+    del api_key_fingerprint
+    return request_monthly_pod_billing(base_url, _api_key)
+
+
+def clear_runpod_read_caches() -> None:
+    cached_runpod_pods.clear()
+    cached_runpod_account.clear()
+    cached_runpod_billing.clear()
+
+
+def prefetch_runpod_data(
+    base_url: str,
+    api_key: str,
+    page: str,
+) -> tuple[ThreadPoolExecutor | None, dict[str, Any]]:
+    """Warm independent RunPod reads concurrently for the current page."""
+    if not api_key:
+        return None, {}
+    fingerprint = credential_fingerprint(api_key)
+    executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="runpod-preload")
+    futures: dict[str, Any] = {
+        "account": executor.submit(cached_runpod_account, fingerprint, api_key),
+    }
+    if page in {"Vue d'ensemble", "Machines", "Harnesses"}:
+        futures["pods"] = executor.submit(
+            cached_runpod_pods,
+            base_url,
+            fingerprint,
+            api_key,
+        )
+    if page == "Vue d'ensemble":
+        futures["billing"] = executor.submit(
+            cached_runpod_billing,
+            base_url,
+            fingerprint,
+            api_key,
+        )
+    return executor, futures
+
+
 def pod_state(pod: dict[str, Any]) -> str:
     return str(
         pod.get("state")
@@ -229,6 +337,77 @@ def is_active_pod(pod: dict[str, Any]) -> bool:
     return pod_state(pod).upper() in ACTIVE_POD_STATES
 
 
+def local_time_text(value: Any) -> str:
+    parsed = parse_timestamp(value)
+    return parsed.astimezone().strftime("%d/%m/%Y %H:%M") if parsed else "—"
+
+
+def reconcile_lifecycle_policies(
+    base_url: str,
+    api_key: str,
+    pods: list[dict[str, Any]] | None = None,
+) -> list[dict[str, str]]:
+    """Apply overdue stop/delete policies once and persist the result."""
+    if not api_key:
+        return []
+    with policy_lock(LIFECYCLE_POLICIES_PATH) as acquired:
+        if not acquired:
+            return []
+        store = load_policy_store(LIFECYCLE_POLICIES_PATH)
+        policies = store.get("policies", {})
+        if not isinstance(policies, dict) or not policies:
+            return []
+        try:
+            current_pods = pods if pods is not None else cached_runpod_pods(
+                base_url,
+                credential_fingerprint(api_key),
+                api_key,
+            )
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            for policy in policies.values():
+                if isinstance(policy, dict):
+                    mark_error(policy, f"Lecture RunPod impossible : {exc}")
+            save_policy_store(LIFECYCLE_POLICIES_PATH, store)
+            return [{"kind": "error", "message": f"Cycle de vie : lecture RunPod impossible ({exc})."}]
+
+        pods_by_id = {str(pod.get("id")): pod for pod in current_pods if pod.get("id")}
+        events: list[dict[str, str]] = []
+        changed = False
+        now = utc_now()
+        for pod_id, policy in policies.items():
+            if not isinstance(policy, dict):
+                continue
+            pod = pods_by_id.get(str(pod_id))
+            if not pod:
+                continue
+            action = pod_policy_action(policy, pod_state(pod), now)
+            if not action:
+                continue
+            pod_name = str(policy.get("podName") or pod.get("name") or pod_id)
+            if action == "pause_complete":
+                mark_completed(policy, action, now)
+                events.append({"kind": "success", "message": f"{pod_name} est déjà en pause."})
+                changed = True
+                continue
+            try:
+                if action == "stop":
+                    request_runpod("POST", base_url, api_key, f"/pods/{pod_id}/stop")
+                    message = f"Pause automatique demandée pour {pod_name}."
+                else:
+                    request_runpod("DELETE", base_url, api_key, f"/pods/{pod_id}")
+                    message = f"Destruction automatique demandée pour {pod_name}."
+                clear_runpod_read_caches()
+                mark_completed(policy, action, now)
+                events.append({"kind": "success", "message": message})
+            except (requests.RequestException, RuntimeError, ValueError) as exc:
+                mark_error(policy, str(exc), now)
+                events.append({"kind": "error", "message": f"{pod_name} : {exc}"})
+            changed = True
+        if changed:
+            save_policy_store(LIFECYCLE_POLICIES_PATH, store)
+        return events
+
+
 def usd(value: Any, suffix: str = "") -> str:
     return f"${number_value(value):,.2f}{suffix}"
 
@@ -253,6 +432,55 @@ def load_json_object(path: Path) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def save_user_environment_variable(name: str, value: str) -> None:
+    if os.name != "nt":
+        raise RuntimeError("L'enregistrement des variables utilisateur est actuellement disponible sous Windows.")
+    import winreg
+
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER,
+        "Environment",
+        0,
+        winreg.KEY_SET_VALUE,
+    ) as environment_key:
+        winreg.SetValueEx(environment_key, name, 0, winreg.REG_SZ, value)
+    os.environ[name] = value
+    try:
+        import ctypes
+        from ctypes import byref, wintypes
+
+        result = wintypes.DWORD()
+        ctypes.windll.user32.SendMessageTimeoutW(
+            0xFFFF,
+            0x001A,
+            0,
+            "Environment",
+            0x0002,
+            5000,
+            byref(result),
+        )
+    except (AttributeError, OSError):
+        pass
+
+
+def user_environment_value(name: str) -> str:
+    """Read a user environment variable, including values added after this process started."""
+    value = os.getenv(name, "")
+    if value or os.name != "nt" or not name:
+        return value
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as environment_key:
+            registry_value, _ = winreg.QueryValueEx(environment_key, name)
+        value = str(registry_value or "")
+    except OSError:
+        return ""
+    if value:
+        os.environ[name] = value
+    return value
 
 
 def executable_path(name: str) -> str:
@@ -324,6 +552,43 @@ def load_openclaw_models() -> tuple[list[dict[str, Any]], dict[str, Any], str]:
         return [], {}, str(exc)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_openclaw_core() -> tuple[dict[str, Any], str, list[dict[str, Any]], dict[str, Any], str]:
+    """Load independent OpenClaw CLI inventories concurrently and cache the result."""
+
+    def load_schema() -> tuple[dict[str, Any], str]:
+        try:
+            value = run_cli_json("openclaw", ["config", "schema"], timeout=60)
+            return (value if isinstance(value, dict) else {}), ""
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            return {}, str(exc)
+
+    def load_model_list() -> tuple[list[dict[str, Any]], str]:
+        try:
+            value = run_cli_json("openclaw", ["models", "list", "--json"], timeout=60)
+            items = value if isinstance(value, list) else value.get("models", []) if isinstance(value, dict) else []
+            return [item for item in items if isinstance(item, dict)], ""
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            return [], str(exc)
+
+    def load_model_status() -> tuple[dict[str, Any], str]:
+        try:
+            value = run_cli_json("openclaw", ["models", "status", "--json"], timeout=60)
+            return (value if isinstance(value, dict) else {}), ""
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            return {}, str(exc)
+
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="openclaw-core") as executor:
+        schema_future = executor.submit(load_schema)
+        models_future = executor.submit(load_model_list)
+        status_future = executor.submit(load_model_status)
+        schema, schema_error = schema_future.result()
+        models, models_error = models_future.result()
+        status, status_error = status_future.result()
+    model_error = "; ".join(error for error in (models_error, status_error) if error)
+    return schema, schema_error, models, status, model_error
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_openclaw_plugins() -> tuple[list[dict[str, Any]], str]:
     try:
@@ -344,6 +609,16 @@ def load_openclaw_skills() -> tuple[list[dict[str, Any]], str]:
         return [], str(exc)
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def load_openclaw_extensions() -> tuple[list[dict[str, Any]], str, list[dict[str, Any]], str]:
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="openclaw-extensions") as executor:
+        plugins_future = executor.submit(load_openclaw_plugins)
+        skills_future = executor.submit(load_openclaw_skills)
+        plugins, plugin_error = plugins_future.result()
+        skills, skill_error = skills_future.result()
+    return plugins, plugin_error, skills, skill_error
+
+
 def patch_openclaw_config(patch: dict[str, Any]) -> None:
     run_cli(
         "openclaw",
@@ -352,9 +627,11 @@ def patch_openclaw_config(patch: dict[str, Any]) -> None:
         timeout=60,
     )
     run_cli("openclaw", ["config", "validate"], timeout=60)
+    load_openclaw_core.clear()
     load_openclaw_models.clear()
     load_openclaw_plugins.clear()
     load_openclaw_skills.clear()
+    load_openclaw_extensions.clear()
 
 
 def save_json_config(path: Path, value: dict[str, Any]) -> Path | None:
@@ -543,6 +820,10 @@ def scan_qwen_skills() -> list[dict[str, Any]]:
 def resolve_config_value(value: Any) -> str:
     if not isinstance(value, str) or not value or value.startswith("<"):
         return ""
+    if value.startswith("${") and value.endswith("}"):
+        return user_environment_value(value[2:-1].strip())
+    if value.startswith("%") and value.endswith("%"):
+        return user_environment_value(value[1:-1].strip())
     expanded = os.path.expandvars(value)
     if expanded != value:
         return expanded
@@ -556,49 +837,190 @@ def resolve_config_value(value: Any) -> str:
     return value
 
 
+def secret_value_and_reference(value: Any) -> tuple[str, str]:
+    """Resolve direct values and environment-backed OpenClaw secret references."""
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate.startswith("${") and candidate.endswith("}"):
+            environment_name = candidate[2:-1].strip()
+            return user_environment_value(environment_name), environment_name
+        if candidate.startswith("%") and candidate.endswith("%"):
+            environment_name = candidate[1:-1].strip()
+            return user_environment_value(environment_name), environment_name
+        return candidate, "openclaw.json" if candidate else ""
+    if isinstance(value, dict) and str(value.get("source") or "").lower() == "env":
+        environment_name = str(value.get("id") or value.get("name") or "").strip()
+        return user_environment_value(environment_name), environment_name
+    return "", ""
+
+
+def openclaw_access_details() -> dict[str, str]:
+    """Return local connection details without rendering or persisting secrets."""
+    config = load_json_object(OPENCLAW_CONFIG_PATH)
+    gateway = config.get("gateway") if isinstance(config.get("gateway"), dict) else {}
+    auth = gateway.get("auth") if isinstance(gateway.get("auth"), dict) else {}
+    provider = nested_value(config, "models.providers.vllm", {})
+    provider = provider if isinstance(provider, dict) else {}
+    gateway_token, gateway_reference = secret_value_and_reference(auth.get("token"))
+    api_key, api_key_reference = secret_value_and_reference(provider.get("apiKey"))
+    primary_model = str(nested_value(config, "agents.defaults.model.primary", "") or "")
+    model = primary_model.removeprefix("vllm/")
+    if not model:
+        models = provider.get("models")
+        if isinstance(models, list) and models and isinstance(models[0], dict):
+            model = str(models[0].get("id") or "")
+    port = int(gateway.get("port") or 18789)
+    return {
+        "gateway_url": f"http://127.0.0.1:{port}",
+        "gateway_token": gateway_token,
+        "gateway_reference": gateway_reference,
+        "vllm_endpoint": str(provider.get("baseUrl") or "").rstrip("/"),
+        "vllm_model": model,
+        "vllm_api_key": api_key,
+        "vllm_api_key_reference": api_key_reference,
+    }
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def load_openclaw_device_pairings() -> tuple[list[dict[str, Any]], str]:
+    try:
+        result = run_cli_json("openclaw", ["devices", "list", "--json"], timeout=30)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        return [], str(exc)
+    pending = result.get("pending") if isinstance(result, dict) else []
+    return [item for item in pending if isinstance(item, dict)], ""
+
+
+def render_openclaw_access_panel() -> None:
+    access = openclaw_access_details()
+    with st.expander("Acces Companion et vLLM"):
+        st.markdown("##### OpenClaw Companion")
+        st.text_input(
+            "URL Gateway",
+            value=access["gateway_url"],
+            disabled=True,
+            key="openclaw_access_gateway_url",
+        )
+        gateway_reference = access["gateway_reference"] or "non disponible"
+        st.caption(f"Jeton Gateway : {gateway_reference}")
+        reveal_gateway = st.button(
+            "Afficher le jeton Gateway",
+            key="openclaw_reveal_gateway_token",
+            disabled=not bool(access["gateway_token"]),
+        )
+        if reveal_gateway:
+            st.session_state["openclaw_show_gateway_token"] = True
+        if st.session_state.get("openclaw_show_gateway_token"):
+            if st.button("Masquer le jeton Gateway", key="openclaw_hide_gateway_token"):
+                st.session_state.pop("openclaw_show_gateway_token", None)
+                st.rerun()
+            st.code(access["gateway_token"], language=None)
+
+        st.markdown("##### API vLLM active")
+        st.text_input(
+            "Endpoint vLLM",
+            value=access["vllm_endpoint"] or "Non configure",
+            disabled=True,
+            key="openclaw_access_vllm_endpoint",
+        )
+        st.text_input(
+            "Modele vLLM",
+            value=access["vllm_model"] or "Non configure",
+            disabled=True,
+            key="openclaw_access_vllm_model",
+        )
+        api_key_reference = access["vllm_api_key_reference"] or "non disponible"
+        st.caption(f"Cle API vLLM : {api_key_reference}")
+        reveal_api_key = st.button(
+            "Afficher la cle API vLLM",
+            key="openclaw_reveal_vllm_api_key",
+            disabled=not bool(access["vllm_api_key"]),
+        )
+        if reveal_api_key:
+            st.session_state["openclaw_show_vllm_api_key"] = True
+        if st.session_state.get("openclaw_show_vllm_api_key"):
+            if st.button("Masquer la cle API vLLM", key="openclaw_hide_vllm_api_key"):
+                st.session_state.pop("openclaw_show_vllm_api_key", None)
+                st.rerun()
+            st.code(access["vllm_api_key"], language=None)
+
+        st.markdown("##### Appareils a approuver")
+        if st.button(
+            "Vérifier les demandes",
+            icon=":material/refresh:",
+            key="refresh_openclaw_pairings",
+        ):
+            load_openclaw_device_pairings.clear()
+            pending_pairings, pairing_error = load_openclaw_device_pairings()
+            st.session_state["openclaw_pairing_snapshot"] = {
+                "items": pending_pairings,
+                "error": pairing_error,
+            }
+        pairing_snapshot = st.session_state.get("openclaw_pairing_snapshot")
+        if not isinstance(pairing_snapshot, dict):
+            st.caption("Demandes non chargées.")
+        elif pairing_snapshot.get("error"):
+            st.warning("Impossible de lire les demandes de pairage OpenClaw.")
+        elif not pairing_snapshot.get("items"):
+            st.caption("Aucune demande d'approbation en attente.")
+        else:
+            pending_pairings = pairing_snapshot["items"]
+            for index, pairing in enumerate(pending_pairings):
+                request_id = str(pairing.get("requestId") or "")
+                device_name = str(
+                    pairing.get("displayName")
+                    or pairing.get("clientId")
+                    or pairing.get("deviceId")
+                    or "Appareil inconnu"
+                )
+                platform = str(pairing.get("platform") or "Inconnue")
+                role = str(pairing.get("role") or "operator")
+                left, right = st.columns([4, 1])
+                with left:
+                    st.markdown(f"**{device_name}**")
+                    st.caption(f"Plateforme : {platform} · Role : {role}")
+                with right:
+                    approved = st.button(
+                        "Approuver",
+                        key=f"openclaw_approve_pairing_{request_id or index}",
+                        disabled=not bool(request_id),
+                        type="primary",
+                    )
+                if approved:
+                    try:
+                        run_cli("openclaw", ["devices", "approve", request_id], timeout=30)
+                        load_openclaw_device_pairings.clear()
+                        st.session_state.pop("openclaw_pairing_snapshot", None)
+                        st.success(f"Appareil approuve : {device_name}")
+                        st.rerun()
+                    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                        st.error(f"Approbation impossible : {exc}")
+
+
+@st.cache_data(ttl=15, show_spinner=False)
 def scan_harness_processes() -> dict[str, list[dict[str, Any]]]:
     processes: dict[str, list[dict[str, Any]]] = {"openclaw": [], "qwen-code": []}
-    if os.name != "nt":
+    if psutil is None:
         return processes
-    command = """
-    $items = Get-CimInstance Win32_Process | ForEach-Object {
-      $created = 0
-      if ($_.CreationDate) {
-        $created = ([DateTimeOffset]$_.CreationDate).ToUnixTimeSeconds()
-      }
-      [PSCustomObject]@{
-        pid = $_.ProcessId
-        name = $_.Name
-        commandLine = $_.CommandLine
-        createTime = $created
-        memoryBytes = $_.WorkingSetSize
-      }
-    }
-    @($items) | ConvertTo-Json -Compress
-    """
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    try:
-        result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", command],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=8,
-            check=False,
-            creationflags=creation_flags,
-        )
-        values = json.loads(result.stdout) if result.returncode == 0 and result.stdout.strip() else []
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
-        return processes
-    if isinstance(values, dict):
-        values = [values]
-    for info in values if isinstance(values, list) else []:
-        if not isinstance(info, dict):
+    for process in psutil.process_iter(["pid", "name"]):
+        try:
+            info = process.info
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
         name = str(info.get("name") or "")
         executable = name.lower()
-        command_line = str(info.get("commandLine") or "")
+        if not (
+            executable.startswith(("openclaw", "qwen"))
+            or executable in {"node", "node.exe"}
+        ):
+            continue
+        try:
+            command = [str(argument) for argument in process.cmdline()]
+            create_time = process.create_time()
+            memory_info = process.memory_info()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        command_line = " ".join(command)
         command_text = command_line.lower()
         harness_id = ""
         if executable.startswith("openclaw") or (
@@ -615,9 +1037,9 @@ def scan_harness_processes() -> dict[str, list[dict[str, Any]]]:
             {
                 "pid": int(info.get("pid") or 0),
                 "name": name,
-                "cmdline": command_line.split(),
-                "create_time": number_value(info.get("createTime")),
-                "memory_bytes": int(info.get("memoryBytes") or 0),
+                "cmdline": command,
+                "create_time": number_value(create_time),
+                "memory_bytes": int(getattr(memory_info, "rss", 0) or 0),
             }
         )
     return processes
@@ -653,6 +1075,151 @@ def effective_harness_connection(config: dict[str, Any], override: dict[str, Any
     return connection
 
 
+def normalized_model_id(value: Any) -> str:
+    model = str(value or "").strip()
+    return model.split("/", 1)[-1] if model.startswith("vllm/") else model
+
+
+def matching_pool_connection(
+    config: dict[str, Any],
+    connections: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    endpoint = str(config.get("base_url") or "").strip().rstrip("/")
+    model = normalized_model_id(config.get("model"))
+    for connection in connections:
+        connection_endpoint = str(connection.get("baseUrl") or "").strip().rstrip("/")
+        connection_model = normalized_model_id(connection.get("model"))
+        if endpoint and endpoint == connection_endpoint and (not model or model == connection_model):
+            return connection
+    return None
+
+
+def pool_connection_override(
+    harness_id: str,
+    config: dict[str, Any],
+    connection: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a session-only harness override from a saved vLLM pool entry."""
+    api_key_env = str(connection.get("apiKeyEnv") or "")
+    override = {
+        "base_url": str(connection.get("baseUrl") or "").strip().rstrip("/"),
+        "api_key": user_environment_value(api_key_env),
+        "model": str(connection.get("model") or "").strip(),
+    }
+    return override
+
+
+def activate_openclaw_vllm_connection(connection: dict[str, Any]) -> None:
+    """Persist the selected instance as OpenClaw's primary vLLM provider."""
+    model_ref = f"vllm/{connection['model']}"
+    api_key_env = str(connection.get("apiKeyEnv") or "")
+    api_key = user_environment_value(api_key_env)
+    if not api_key:
+        raise RuntimeError(f"La variable Windows {api_key_env or 'de clé vLLM'} est absente ou vide.")
+    synchronize_openclaw_vllm_auth(api_key)
+    config = load_json_object(OPENCLAW_CONFIG_PATH)
+    if not config:
+        raise RuntimeError(f"Configuration OpenClaw absente ou invalide : {OPENCLAW_CONFIG_PATH}")
+    provider_config = openclaw_provider_config(connection)
+    provider_config["apiKey"] = "${VLLM_API_KEY}"
+    set_nested_value(config, "models.providers.vllm", provider_config)
+    set_nested_value(config, "agents.defaults.model.primary", model_ref)
+    available_models = nested_value(config, "agents.defaults.models", {})
+    if not isinstance(available_models, dict):
+        available_models = {}
+    available_models[model_ref] = {}
+    set_nested_value(config, "agents.defaults.models", available_models)
+    save_json_config(OPENCLAW_CONFIG_PATH, config)
+    run_cli("openclaw", ["config", "validate"], timeout=60)
+    load_openclaw_core.clear()
+    load_openclaw_models.clear()
+    load_openclaw_plugins.clear()
+    load_openclaw_skills.clear()
+    load_openclaw_extensions.clear()
+
+
+def synchronize_openclaw_vllm_auth(api_key: str) -> None:
+    """Keep OpenClaw's native env key and higher-priority auth profile aligned."""
+    global _OPENCLAW_AUTH_PROFILE_FINGERPRINT
+    if not api_key:
+        raise RuntimeError("La clé API vLLM active est absente.")
+    save_user_environment_variable("VLLM_API_KEY", api_key)
+    fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    if fingerprint == _OPENCLAW_AUTH_PROFILE_FINGERPRINT:
+        return
+    run_cli(
+        "openclaw",
+        [
+            "models",
+            "auth",
+            "paste-api-key",
+            "--provider",
+            "vllm",
+            "--profile-id",
+            "vllm:default",
+        ],
+        input_text=api_key + "\n",
+        timeout=45,
+    )
+    _OPENCLAW_AUTH_PROFILE_FINGERPRINT = fingerprint
+
+
+def validate_harness_vllm(config: dict[str, Any]) -> None:
+    base_url = str(config.get("base_url") or "").strip().rstrip("/")
+    api_key = str(config.get("api_key") or "").strip()
+    model = normalized_model_id(config.get("model"))
+    if not base_url or not model:
+        raise RuntimeError("Renseigne au minimum l'endpoint vLLM et le modèle.")
+    if not api_key:
+        raise RuntimeError("La clé API vLLM active est absente. Sélectionne de nouveau l'instance.")
+    try:
+        response = requests.get(
+            f"{base_url}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Endpoint vLLM injoignable avant lancement : {exc}") from exc
+    if response.status_code == 401:
+        raise RuntimeError("La clé API vLLM sélectionnée est rejetée par le serveur (HTTP 401).")
+    if response.status_code >= 400:
+        raise RuntimeError(f"Validation vLLM impossible : HTTP {response.status_code}.")
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    model_entries = payload.get("data", []) if isinstance(payload, dict) else []
+    served_models = [
+        str(item.get("id") or "")
+        for item in model_entries
+        if isinstance(item, dict)
+    ]
+    if served_models and not model_alignment(model, served_models):
+        raise RuntimeError(
+            f"Le modèle configuré {model} n'est pas servi par cette instance vLLM."
+        )
+
+
+def openclaw_provider_environment() -> dict[str, str]:
+    """Resolve environment-backed secrets for generated OpenClaw providers."""
+    config = load_json_object(OPENCLAW_CONFIG_PATH)
+    providers = nested_value(config, "models.providers", {})
+    if not isinstance(providers, dict):
+        return {}
+    environment: dict[str, str] = {}
+    for provider_id, provider in providers.items():
+        if not str(provider_id).startswith("vllm-") or not isinstance(provider, dict):
+            continue
+        api_key = provider.get("apiKey")
+        if not isinstance(api_key, str) or not api_key.startswith("${") or not api_key.endswith("}"):
+            continue
+        environment_name = api_key[2:-1].strip()
+        environment_value = user_environment_value(environment_name)
+        if environment_name and environment_value:
+            environment[environment_name] = environment_value
+    return environment
+
+
 def start_harness(harness_id: str, config: dict[str, Any]) -> None:
     if os.name != "nt":
         raise RuntimeError("Le pilotage des harnesses est actuellement disponible uniquement sous Windows.")
@@ -666,10 +1233,14 @@ def start_harness(harness_id: str, config: dict[str, Any]) -> None:
     api_key = str(config.get("api_key") or "").strip()
     configured_model = str(config.get("model") or "").strip()
     model = configured_model.split("/", 1)[-1]
-    if not base_url or not model:
-        raise RuntimeError("Renseigne au minimum l'endpoint vLLM et le modèle dans Options vLLM.")
+    validate_harness_vllm(config)
+    if harness_id == "openclaw":
+        synchronize_openclaw_vllm_auth(api_key)
 
     environment = os.environ.copy()
+    environment.setdefault("NODE_USE_SYSTEM_CA", "1")
+    if harness_id == "openclaw":
+        environment.update(openclaw_provider_environment())
     environment.update(
         {
             "VLLM_BASE_URL": base_url,
@@ -695,6 +1266,7 @@ def start_harness(harness_id: str, config: dict[str, Any]) -> None:
         env=environment,
         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
     )
+    scan_harness_processes.clear()
 
 
 def stop_harness(processes: list[dict[str, Any]]) -> int:
@@ -723,6 +1295,8 @@ def stop_harness(processes: list[dict[str, Any]]) -> int:
             errors.append(result.stderr.strip())
     if stopped == 0 and errors:
         raise RuntimeError(errors[0][:300])
+    if stopped:
+        scan_harness_processes.clear()
     return stopped
 
 
@@ -783,7 +1357,13 @@ def tcp_port_open(host: str, port: int) -> bool:
         return False
 
 
-def probe_vllm(base_url: str, api_key: str) -> dict[str, Any]:
+@st.cache_data(ttl=12, max_entries=32, show_spinner=False)
+def cached_probe_vllm(
+    base_url: str,
+    api_key_fingerprint: str,
+    _api_key: str,
+) -> dict[str, Any]:
+    del api_key_fingerprint
     if not base_url:
         return {
             "label": "Non configuré",
@@ -794,7 +1374,7 @@ def probe_vllm(base_url: str, api_key: str) -> dict[str, Any]:
         }
     started = datetime.now(timezone.utc)
     try:
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        headers = {"Authorization": f"Bearer {_api_key}"} if _api_key else {}
         response = requests.get(f"{base_url.rstrip('/')}/models", headers=headers, timeout=5)
         latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
         if response.ok:
@@ -832,6 +1412,14 @@ def probe_vllm(base_url: str, api_key: str) -> dict[str, Any]:
         }
 
 
+def probe_vllm(base_url: str, api_key: str) -> dict[str, Any]:
+    return cached_probe_vllm(
+        base_url.strip().rstrip("/"),
+        credential_fingerprint(api_key),
+        api_key,
+    )
+
+
 def duration_text(started_at: float) -> str:
     if started_at <= 0:
         return "—"
@@ -844,6 +1432,31 @@ def duration_text(started_at: float) -> str:
     if hours:
         return f"{hours} h {minutes} min"
     return f"{minutes} min"
+
+
+def pod_runtime_text(pod: dict[str, Any]) -> str:
+    started_at = (
+        parse_timestamp(pod.get("lastStartedAt"))
+        or parse_timestamp(pod.get("createdAt"))
+        or parse_timestamp(pod.get("created_at"))
+    )
+    if not started_at:
+        pod_id = str(pod.get("id") or "")
+        store = load_connection_store(VLLM_CONNECTIONS_PATH)
+        for connection in store.get("connections", []):
+            if isinstance(connection, dict) and str(connection.get("podId") or "") == pod_id:
+                started_at = parse_timestamp(connection.get("createdAt"))
+                break
+    if not started_at:
+        return "En attente"
+    elapsed_seconds = max(0, int((datetime.now(timezone.utc) - started_at).total_seconds()))
+    hours, remainder = divmod(elapsed_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours} h {minutes:02d} min"
+    if minutes:
+        return f"{minutes} min {seconds:02d} s"
+    return f"{seconds} s"
 
 
 def memory_text(memory_bytes: int) -> str:
@@ -935,6 +1548,16 @@ def request_gpu_catalog(api_key: str, cloud_type: str) -> list[dict[str, Any]]:
     if not isinstance(gpu_types, list):
         raise RuntimeError("Réponse GPU Runpod inattendue")
     return gpu_types
+
+
+@st.cache_data(ttl=60, max_entries=8, show_spinner=False)
+def cached_gpu_catalog(
+    cloud_type: str,
+    api_key_fingerprint: str,
+    _api_key: str,
+) -> list[dict[str, Any]]:
+    del api_key_fingerprint
+    return request_gpu_catalog(_api_key, cloud_type)
 
 
 def gpu_option_label(gpu: dict[str, Any], cloud_type: str) -> str:
@@ -1058,6 +1681,26 @@ def credentials_for(pod_id: str, model: str, vllm_api_key: str, service_type: st
     return credentials
 
 
+def saved_vllm_credentials(pod_id: str) -> dict[str, str] | None:
+    """Resolve a deployment credential from the local catalog without exposing its key."""
+    store = load_connection_store(VLLM_CONNECTIONS_PATH)
+    for connection in store.get("connections", []):
+        if not isinstance(connection, dict) or str(connection.get("podId") or "") != pod_id:
+            continue
+        api_key = user_environment_value(str(connection.get("apiKeyEnv") or ""))
+        base_url = str(connection.get("baseUrl") or "").strip().rstrip("/")
+        model = str(connection.get("model") or "").strip()
+        if api_key and base_url and model:
+            return {
+                "VLLM_BASE_URL": base_url,
+                "VLLM_API_KEY": api_key,
+                "VLLM_MODEL": model,
+                "OPENAI_BASE_URL": base_url,
+                "OPENAI_API_KEY": api_key,
+            }
+    return None
+
+
 def credentials_text(credentials: dict[str, str]) -> str:
     return "\n".join(f'{key}="{value}"' for key, value in credentials.items())
 
@@ -1076,34 +1719,39 @@ def vllm_health(pod: dict[str, Any], credentials: dict[str, str] | None) -> dict
         }
 
     try:
-        response = requests.get(
-            f"{credentials['VLLM_BASE_URL'].rstrip('/')}/models",
-            headers={"Authorization": f"Bearer {credentials['VLLM_API_KEY']}"},
-            timeout=5,
+        probe = probe_vllm(
+            credentials["VLLM_BASE_URL"],
+            credentials["VLLM_API_KEY"],
         )
-        if response.ok:
-            return {
-                "label": "Operationnel",
-                "color": "#16a34a",
-                "detail": "vLLM repond correctement sur /v1/models.",
-            }
-        if response.status_code in {401, 403}:
-            return {
-                "label": "Erreur auth",
-                "color": "#dc2626",
-                "detail": f"vLLM repond avec HTTP {response.status_code}.",
-            }
-        return {
-            "label": "Demarrage",
-            "color": "#d97706",
-            "detail": f"L'endpoint repond encore avec HTTP {response.status_code}.",
-        }
-    except (requests.RequestException, KeyError):
+    except KeyError:
         return {
             "label": "Hors ligne",
             "color": "#dc2626",
-            "detail": "L'endpoint vLLM n'est pas joignable pour le moment.",
+            "detail": "Les credentials vLLM sont incomplets.",
         }
+    if probe.get("label") == "Connecté":
+        return {
+            "label": "Operationnel",
+            "color": "#16a34a",
+            "detail": "vLLM repond correctement sur /v1/models.",
+        }
+    if probe.get("label") == "Erreur auth":
+        return {
+            "label": "Erreur auth",
+            "color": "#dc2626",
+            "detail": str(probe.get("detail") or "La cle vLLM est refusee."),
+        }
+    if probe.get("label") == "Dégradé":
+        return {
+            "label": "Demarrage",
+            "color": "#d97706",
+            "detail": str(probe.get("detail") or "vLLM est encore en cours de demarrage."),
+        }
+    return {
+        "label": "Hors ligne",
+        "color": "#dc2626",
+        "detail": str(probe.get("detail") or "L'endpoint vLLM n'est pas joignable pour le moment."),
+    }
 
 
 def status_badge(status: dict[str, str]) -> str:
@@ -1231,6 +1879,7 @@ def inject_dashboard_styles() -> None:
         }
         .harness-logo {
             height: 112px;
+            margin-bottom: 1rem;
             background: #f3f6f8;
             border-radius: 6px;
             display: flex;
@@ -1289,11 +1938,51 @@ def inject_dashboard_styles() -> None:
             line-height: 1.45;
             overflow-wrap: anywhere;
         }
+        .harness-active-connection {
+            display: grid;
+            grid-template-columns: minmax(180px, 0.75fr) minmax(220px, 1fr) minmax(300px, 1.45fr);
+            gap: 1rem;
+            margin: 0.9rem 0 1rem;
+            padding: 1rem 1.1rem;
+            border-left: 4px solid #35c98b;
+            background: #131d24;
+        }
+        .harness-active-connection span,
+        .harness-selection-preview span {
+            display: block;
+            color: #98a5b2;
+            font-size: 0.8rem;
+            margin-bottom: 0.3rem;
+        }
+        .harness-active-connection strong,
+        .harness-selection-preview strong {
+            display: block;
+            color: #f3f6f8;
+            font-size: 0.98rem;
+            line-height: 1.4;
+            overflow-wrap: anywhere;
+        }
+        .harness-active-connection .active-label {
+            color: #57dfaa;
+            font-size: 0.77rem;
+            font-weight: 750;
+            text-transform: uppercase;
+        }
+        .harness-selection-preview {
+            display: grid;
+            grid-template-columns: minmax(160px, 0.7fr) minmax(220px, 1fr) minmax(280px, 1.35fr);
+            gap: 1rem;
+            margin: 0.65rem 0 0.85rem;
+            padding: 0.85rem 0;
+            border-top: 1px solid #2d3945;
+            border-bottom: 1px solid #2d3945;
+        }
         @media (max-width: 900px) {
             .harness-stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .harness-stat:nth-child(2) { border-right: 0; }
             .harness-stat:nth-child(-n+2) { border-bottom: 1px solid #26313d; }
             .harness-connection-grid { grid-template-columns: 1fr; }
+            .harness-active-connection, .harness-selection-preview { grid-template-columns: 1fr; }
         }
         </style>
         """,
@@ -1311,6 +2000,8 @@ def render_overview(
     refresh_col, timestamp_col = st.columns([1, 4])
     with refresh_col:
         if st.button("Actualiser", key="refresh_overview"):
+            clear_runpod_read_caches()
+            cached_probe_vllm.clear()
             st.rerun()
     with timestamp_col:
         st.caption(f"Dernière lecture : {datetime.now().astimezone().strftime('%H:%M:%S')}")
@@ -1323,12 +2014,13 @@ def render_overview(
     billing: list[dict[str, Any]] = []
     pods_error = ""
     billing_error = ""
+    fingerprint = credential_fingerprint(api_key)
     try:
-        pods = response_items(request_runpod("GET", base_url, api_key, "/pods"))
+        pods = cached_runpod_pods(base_url, fingerprint, api_key)
     except (requests.RequestException, RuntimeError, ValueError) as exc:
         pods_error = str(exc)
     try:
-        billing = request_monthly_pod_billing(base_url, api_key)
+        billing = cached_runpod_billing(base_url, fingerprint, api_key)
     except (requests.RequestException, RuntimeError, ValueError) as exc:
         billing_error = str(exc)
 
@@ -1430,6 +2122,40 @@ def render_overview(
             st.dataframe(billing_settings, width="stretch", hide_index=True)
 
 
+def configured_openclaw_pool_connection_ids(
+    connections: list[dict[str, Any]],
+) -> set[str]:
+    """Return catalog connections currently materialized as OpenClaw agents."""
+    config = load_json_object(OPENCLAW_CONFIG_PATH)
+    agents = nested_value(config, "agents.list", [])
+    if not isinstance(agents, list):
+        return set()
+    connection_by_model = {
+        openclaw_model_ref(connection): str(connection.get("id") or "")
+        for connection in connections
+        if connection.get("id") and connection.get("model")
+    }
+    return {
+        connection_by_model[str(agent.get("model") or "")]
+        for agent in agents
+        if isinstance(agent, dict) and str(agent.get("model") or "") in connection_by_model
+    }
+
+
+def split_current_and_stale_connections(
+    connections: list[dict[str, Any]],
+    pods: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Hide catalog entries whose RunPod pod no longer exists."""
+    current_pod_ids = {str(pod.get("id") or "") for pod in pods if pod.get("id")}
+    current: list[dict[str, Any]] = []
+    stale: list[dict[str, Any]] = []
+    for connection in connections:
+        pod_id = str(connection.get("podId") or "").strip()
+        (stale if pod_id and pod_id not in current_pod_ids else current).append(connection)
+    return current, stale
+
+
 def render_harness_card(
     harness_id: str,
     name: str,
@@ -1437,12 +2163,30 @@ def render_harness_card(
     config: dict[str, Any],
     process_metrics: dict[str, Any],
     vllm_probe: dict[str, Any],
+    pool_connections: list[dict[str, Any]],
 ) -> None:
     running = bool(process_metrics.get("running"))
     gateway_ready = True
     if harness_id == "openclaw":
         gateway_ready = tcp_port_open("127.0.0.1", int(config.get("gateway_port") or 18789))
     alignment = model_alignment(str(config.get("model") or ""), vllm_probe.get("models") or [])
+    active_connections = [
+        connection
+        for connection in pool_connections
+        if connection.get("enabled", True)
+        and connection.get("id")
+        and connection.get("baseUrl")
+        and connection.get("model")
+    ]
+    active_pool_connection = matching_pool_connection(config, active_connections)
+    session_source = str(
+        st.session_state.get("harness_runtime_connection_sources", {}).get(harness_id) or ""
+    )
+    active_source = session_source or str(
+        (active_pool_connection or {}).get("name")
+        or (active_pool_connection or {}).get("id")
+        or "Configuration manuelle"
+    )
 
     if not running:
         overall = {"label": "Arrêté", "color": "#dc2626"}
@@ -1480,7 +2224,7 @@ def render_harness_card(
             else:
                 st.error(feedback[1])
 
-        action_col, options_col, spacer_col = st.columns([1, 1.2, 2.8])
+        action_col, restart_col, options_col = st.columns([1, 1.15, 1.35])
         with action_col:
             if st.button(
                 "Arrêter" if running else "Démarrer",
@@ -1501,6 +2245,27 @@ def render_harness_card(
                 except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                     st.session_state["harness_feedback"][harness_id] = ("error", str(exc))
                 st.rerun()
+        with restart_col:
+            if st.button(
+                "Redemarrer",
+                icon=":material/restart_alt:",
+                key=f"harness_restart_{harness_id}",
+                disabled=not running,
+                width="stretch",
+            ):
+                try:
+                    validate_harness_vllm(config)
+                    stopped = stop_harness(config.get("processes") or [])
+                    time.sleep(0.8)
+                    start_harness(harness_id, config)
+                    st.session_state["harness_feedback"][harness_id] = (
+                        "success",
+                        f"{name} redemarre ({stopped} arbre(s) de processus arretes).",
+                    )
+                    time.sleep(0.7)
+                except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                    st.session_state["harness_feedback"][harness_id] = ("error", str(exc))
+                st.rerun()
         with options_col:
             options_key = f"show_harness_options_{harness_id}"
             options_open = bool(st.session_state.get(options_key))
@@ -1512,9 +2277,6 @@ def render_harness_card(
             ):
                 st.session_state[options_key] = not options_open
                 st.rerun()
-        with spacer_col:
-            st.caption("La connexion temporaire est injectée au prochain lancement du harness.")
-
         stats = [
             ("Processus", str(process_metrics.get("count", 0))),
             ("En ligne depuis", duration_text(number_value(process_metrics.get("started_at")))),
@@ -1530,93 +2292,266 @@ def render_harness_card(
         st.markdown(f'<div class="harness-stat-grid">{stat_markup}</div>', unsafe_allow_html=True)
 
         alignment_label = "Modèle aligné" if alignment is True else "Modèle différent" if alignment is False else "Non vérifiable"
-        connection_markup = (
-            '<div class="harness-connection-grid">'
-            '<div class="harness-connection"><span>Modèle configuré</span>'
+        active_label = "Connexion utilisée" if running else "Configuration au prochain lancement"
+        active_markup = (
+            '<div class="harness-active-connection">'
+            '<div><span class="active-label">'
+            f'{html.escape(active_label)}</span><strong>{html.escape(active_source)}</strong></div>'
+            '<div><span>Modèle</span>'
             f'<strong>{html.escape(str(config.get("model") or "Non renseigné"))}</strong></div>'
-            '<div class="harness-connection"><span>Endpoint vLLM</span>'
+            '<div><span>Endpoint vLLM</span>'
             f'<strong>{html.escape(str(config.get("base_url") or "Non renseigné"))}</strong></div>'
-            '<div class="harness-connection"><span>État vLLM</span>'
-            f'<strong>{html.escape(str(vllm_probe.get("label") or "Inconnu"))} · {html.escape(alignment_label)}</strong></div>'
             "</div>"
         )
-        st.markdown(connection_markup, unsafe_allow_html=True)
+        st.markdown(active_markup, unsafe_allow_html=True)
+        st.caption(
+            f"État vLLM : {vllm_probe.get('label') or 'Inconnu'} · {alignment_label}"
+        )
 
         options_key = f"show_harness_options_{harness_id}"
         if st.session_state.get(options_key):
-            st.markdown("#### Connexion vLLM temporaire")
-            st.caption("Ces valeurs restent dans la session Streamlit et ne sont pas écrites dans les fichiers locaux.")
-            with st.form(f"harness_connection_form_{harness_id}", border=False):
-                endpoint_value = st.text_input(
-                    "Endpoint OpenAI-compatible",
-                    value=str(config.get("base_url") or ""),
-                    placeholder="https://<pod-id>-8000.proxy.runpod.net/v1",
-                )
-                key_value = st.text_input(
-                    "Clé API vLLM",
-                    type="password",
-                    placeholder="Laisser vide pour conserver la clé locale actuelle",
-                    help="La clé détectée n'est jamais préremplie dans le navigateur. Saisis-en une uniquement pour la remplacer temporairement.",
-                )
-                model_value = st.text_input(
-                    "Modèle",
-                    value=str(config.get("model") or ""),
-                    disabled=harness_id == "openclaw",
-                    help=(
-                        "Le modèle OpenClaw reste défini dans openclaw.json ; l'endpoint et la clé sont injectés à la volée."
-                        if harness_id == "openclaw"
-                        else "Identifiant du modèle exposé par vLLM."
-                    ),
-                )
-                restart_now = st.toggle(
-                    "Redémarrer maintenant avec cette connexion",
-                    value=running,
-                    key=f"restart_harness_{harness_id}",
-                )
-                save_col, reset_col = st.columns(2)
-                with save_col:
-                    save_connection = st.form_submit_button(
-                        "Appliquer", icon=":material/link:", type="primary", width="stretch"
-                    )
-                with reset_col:
-                    reset_connection = st.form_submit_button(
-                        "Réinitialiser", icon=":material/restart_alt:", width="stretch"
-                    )
+            st.markdown("#### Changer la connexion vLLM")
+            connection_modes = ["Instance déployée", "Saisie manuelle"]
+            default_mode = connection_modes[0] if active_connections else connection_modes[1]
+            connection_mode = st.segmented_control(
+                "Méthode de connexion",
+                connection_modes,
+                default=default_mode,
+                key=f"vllm_connection_mode_{harness_id}",
+                width="stretch",
+            )
 
-            if save_connection:
-                endpoint_value = endpoint_value.strip().rstrip("/")
-                model_value = model_value.strip()
-                if not endpoint_value.startswith(("http://", "https://")):
-                    st.error("L'endpoint doit commencer par http:// ou https://.")
-                elif not model_value:
-                    st.error("Le modèle ne peut pas être vide.")
+            if connection_mode == "Instance déployée" and active_connections:
+                connection_by_id = {str(connection["id"]): connection for connection in active_connections}
+                connection_ids = ["", *connection_by_id]
+                active_connection_id = str((active_pool_connection or {}).get("id") or "")
+                selected_index = connection_ids.index(active_connection_id) if active_connection_id in connection_ids else 0
+                selected_pool_id = st.selectbox(
+                    "Instance vLLM",
+                    connection_ids,
+                    index=selected_index,
+                    format_func=lambda value: (
+                        "Sélectionner une instance..."
+                        if not value
+                        else
+                        f"{connection_by_id[value].get('name') or value} "
+                        f"- {str(connection_by_id[value].get('podId') or value)[-6:]} "
+                        f"- {connection_by_id[value].get('model') or 'modèle non renseigné'}"
+                    ),
+                    key=f"pool_connection_choice_v2_{harness_id}",
+                )
+                if selected_pool_id:
+                    selected_connection = connection_by_id[selected_pool_id]
+                    key_env = str(selected_connection.get("apiKeyEnv") or "")
+                    selected_additional_ids: list[str] = []
+                    additional_connections: list[dict[str, Any]] = []
+                    additional_changed = False
+                    if harness_id == "openclaw":
+                        configured_additional_ids = configured_openclaw_pool_connection_ids(active_connections)
+                        additional_options = [
+                            connection_id
+                            for connection_id in connection_by_id
+                            if connection_id != selected_pool_id
+                        ]
+                        default_additional_ids = [
+                            connection_id
+                            for connection_id in additional_options
+                            if connection_id in configured_additional_ids
+                        ]
+                        st.markdown("##### Agents supplémentaires")
+                        st.caption(
+                            "Chaque instance supplémentaire crée un agent OpenClaw dédié. "
+                            "L'instance principale reste le modèle utilisé par défaut."
+                        )
+                        selected_additional_ids = st.multiselect(
+                            "Instances vLLM supplémentaires",
+                            options=additional_options,
+                            default=default_additional_ids,
+                            format_func=lambda value: (
+                                f"{connection_by_id[value].get('name') or value} "
+                                f"- {str(connection_by_id[value].get('podId') or value)[-6:]} "
+                                f"- {connection_by_id[value].get('model') or 'modèle non renseigné'}"
+                            ),
+                            key=f"openclaw_additional_vllm_v1_{selected_pool_id}",
+                            placeholder="Ajouter une ou plusieurs instances",
+                        )
+                        additional_connections = [
+                            connection_by_id[connection_id]
+                            for connection_id in selected_additional_ids
+                        ]
+                        additional_changed = set(selected_additional_ids) != configured_additional_ids
+                        st.caption(
+                            f"{len(selected_additional_ids)} agent(s) supplémentaire(s) sélectionné(s)."
+                        )
+                    else:
+                        st.caption(
+                            "Qwen Code utilise une seule connexion vLLM par processus. "
+                            "Le pool multi-agent est disponible avec OpenClaw."
+                        )
+                    already_applied = (
+                        selected_pool_id == active_connection_id and not additional_changed
+                    )
+                    selection_state = "Cette instance est actuellement appliquée."
+                    if already_applied:
+                        st.success(selection_state)
+                    else:
+                        st.warning("Sélection en attente : rien ne change avant de cliquer sur Appliquer.")
+                    selection_markup = (
+                        '<div class="harness-selection-preview">'
+                        '<div><span>Pod</span>'
+                        f'<strong>{html.escape(str(selected_connection.get("podId") or selected_pool_id))}</strong></div>'
+                        '<div><span>Modèle sélectionné</span>'
+                        f'<strong>{html.escape(str(selected_connection.get("model") or "Non renseigné"))}</strong></div>'
+                        '<div><span>Endpoint sélectionné</span>'
+                        f'<strong>{html.escape(str(selected_connection.get("baseUrl") or "Non renseigné"))}</strong></div>'
+                        "</div>"
+                    )
+                    st.markdown(selection_markup, unsafe_allow_html=True)
+                    key_available = bool(user_environment_value(key_env))
+                    st.caption(
+                        f"Clé Windows : {key_env or 'non renseignée'} · "
+                        f"{'disponible' if key_available else 'absente'}"
+                    )
+                    use_pool_connection = st.button(
+                        "Déjà appliquée"
+                        if already_applied
+                        else "Appliquer et redémarrer"
+                        if running
+                        else "Appliquer cette instance",
+                        icon=":material/check_circle:" if already_applied else ":material/sync_alt:",
+                        key=f"use_pool_connection_{harness_id}",
+                        type="primary",
+                        disabled=already_applied,
+                        width="stretch",
+                    )
+                    if use_pool_connection:
+                        pool_override = pool_connection_override(harness_id, config, selected_connection)
+                        if not pool_override["api_key"]:
+                            st.error(f"La variable Windows {key_env or 'de clé'} est absente ou vide.")
+                        elif not pool_override["base_url"] or not pool_override["model"]:
+                            st.error("Cette instance doit contenir un endpoint et un modèle.")
+                        else:
+                            candidate_config = effective_harness_connection(config, pool_override)
+                            try:
+                                validate_harness_vllm(candidate_config)
+                                for additional_connection in additional_connections:
+                                    validate_harness_vllm(
+                                        effective_harness_connection(
+                                            config,
+                                            pool_connection_override(
+                                                harness_id,
+                                                config,
+                                                additional_connection,
+                                            ),
+                                        )
+                                    )
+                            except RuntimeError as exc:
+                                st.error(str(exc))
+                                st.stop()
+                            st.session_state.setdefault("harness_runtime_connections", {})[harness_id] = pool_override
+                            st.session_state.setdefault("harness_runtime_connection_sources", {})[harness_id] = str(
+                                selected_connection.get("name") or selected_pool_id
+                            )
+                            try:
+                                if harness_id == "openclaw":
+                                    activate_openclaw_vllm_connection(selected_connection)
+                                    sync_openclaw_agent_pool(additional_connections)
+                                if running:
+                                    stop_harness(config.get("processes") or [])
+                                    time.sleep(0.7)
+                                    start_harness(harness_id, candidate_config)
+                                message = f"Connexion appliquée : {selected_connection.get('name') or selected_pool_id}."
+                                if additional_connections:
+                                    message += (
+                                        f" {len(additional_connections)} agent(s) OpenClaw "
+                                        "supplémentaire(s) configuré(s)."
+                                    )
+                                if running:
+                                    message += " Harness redémarré."
+                                st.session_state["harness_feedback"][harness_id] = ("success", message)
+                            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                                st.session_state["harness_feedback"][harness_id] = ("error", str(exc))
+                            st.rerun()
                 else:
-                    override = {
-                        "base_url": endpoint_value,
-                        "api_key": key_value.strip() or str(config.get("api_key") or ""),
-                        "model": model_value,
-                    }
-                    st.session_state.setdefault("harness_runtime_connections", {})[harness_id] = override
-                    try:
-                        if restart_now:
+                    st.info("Choisis une instance pour afficher ses détails. La connexion active reste inchangée.")
+
+            elif connection_mode == "Instance déployée":
+                st.info("Aucune instance vLLM enregistrée. Utilise la saisie manuelle ou déploie une machine.")
+
+            if connection_mode == "Saisie manuelle":
+                st.caption("Cette saisie remplace temporairement la connexion détectée.")
+                with st.form(f"harness_connection_form_{harness_id}", border=False):
+                    endpoint_value = st.text_input(
+                        "Endpoint OpenAI-compatible",
+                        value=str(config.get("base_url") or ""),
+                        placeholder="https://<pod-id>-8000.proxy.runpod.net/v1",
+                    )
+                    key_value = st.text_input(
+                        "Clé API vLLM",
+                        type="password",
+                        placeholder="Laisser vide pour conserver la clé actuelle",
+                    )
+                    model_value = st.text_input(
+                        "Modèle",
+                        value=str(config.get("model") or ""),
+                        disabled=harness_id == "openclaw",
+                    )
+                    save_col, reset_col = st.columns(2)
+                    with save_col:
+                        save_connection = st.form_submit_button(
+                            "Appliquer et redémarrer" if running else "Appliquer",
+                            icon=":material/sync_alt:",
+                            type="primary",
+                            width="stretch",
+                        )
+                    with reset_col:
+                        reset_connection = st.form_submit_button(
+                            "Revenir à la config locale",
+                            icon=":material/undo:",
+                            width="stretch",
+                        )
+
+                if save_connection:
+                    endpoint_value = endpoint_value.strip().rstrip("/")
+                    model_value = model_value.strip()
+                    if not endpoint_value.startswith(("http://", "https://")):
+                        st.error("L'endpoint doit commencer par http:// ou https://.")
+                    elif not model_value:
+                        st.error("Le modèle ne peut pas être vide.")
+                    else:
+                        override = {
+                            "base_url": endpoint_value,
+                            "api_key": key_value.strip() or str(config.get("api_key") or ""),
+                            "model": model_value,
+                        }
+                        candidate_config = effective_harness_connection(config, override)
+                        try:
+                            validate_harness_vllm(candidate_config)
+                        except RuntimeError as exc:
+                            st.error(str(exc))
+                            st.stop()
+                        st.session_state.setdefault("harness_runtime_connections", {})[harness_id] = override
+                        st.session_state.setdefault("harness_runtime_connection_sources", {})[harness_id] = "Saisie manuelle"
+                        try:
                             if running:
                                 stop_harness(config.get("processes") or [])
                                 time.sleep(0.7)
-                            start_harness(harness_id, effective_harness_connection(config, override))
-                        message = "Connexion temporaire enregistrée"
-                        if restart_now:
-                            message += " et harness relancé"
-                        st.session_state["harness_feedback"][harness_id] = ("success", message + ".")
-                    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-                        st.session_state["harness_feedback"][harness_id] = ("error", str(exc))
+                                start_harness(harness_id, candidate_config)
+                            message = "Connexion manuelle appliquée."
+                            if running:
+                                message += " Harness redémarré."
+                            st.session_state["harness_feedback"][harness_id] = ("success", message)
+                        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                            st.session_state["harness_feedback"][harness_id] = ("error", str(exc))
+                        st.rerun()
+                elif reset_connection:
+                    st.session_state.setdefault("harness_runtime_connections", {}).pop(harness_id, None)
+                    st.session_state.setdefault("harness_runtime_connection_sources", {}).pop(harness_id, None)
+                    st.session_state["harness_feedback"][harness_id] = (
+                        "success",
+                        "Connexion manuelle supprimée. La configuration locale redevient la référence.",
+                    )
                     st.rerun()
-            elif reset_connection:
-                st.session_state.setdefault("harness_runtime_connections", {}).pop(harness_id, None)
-                st.session_state["harness_feedback"][harness_id] = (
-                    "success",
-                    "Connexion temporaire supprimée. La configuration locale redevient la référence.",
-                )
-                st.rerun()
 
         if harness_id == "openclaw":
             gateway_port = int(config.get("gateway_port") or 18789)
@@ -1627,6 +2562,7 @@ def render_harness_card(
             )
             st.markdown(status_badge(gateway_status), unsafe_allow_html=True)
             st.caption(f"Gateway local : ws://127.0.0.1:{gateway_port}")
+            render_openclaw_access_panel()
 
         st.caption(str(vllm_probe.get("detail") or ""))
         if vllm_probe.get("models"):
@@ -1650,7 +2586,7 @@ def render_harness_card(
 
 
 @st.fragment(run_every=10)
-def render_live_harnesses() -> None:
+def render_live_harnesses(pool_connections: list[dict[str, Any]]) -> None:
     process_groups = scan_harness_processes()
     harnesses = [
         (
@@ -1667,7 +2603,7 @@ def render_live_harnesses() -> None:
         ),
     ]
     probe_cache: dict[tuple[str, str], dict[str, Any]] = {}
-    runtime_rows: list[tuple[str, str, str, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    runtime_rows: list[tuple[str, str, str, dict[str, Any], dict[str, Any], dict[str, Any], list[dict[str, Any]]]] = []
     for harness_id, name, logo, config in harnesses:
         override = st.session_state.get("harness_runtime_connections", {}).get(harness_id)
         config = effective_harness_connection(config, override)
@@ -1675,7 +2611,7 @@ def render_live_harnesses() -> None:
         probe_key = (str(config.get("base_url") or ""), str(config.get("api_key") or ""))
         if probe_key not in probe_cache:
             probe_cache[probe_key] = probe_vllm(*probe_key)
-        runtime_rows.append((harness_id, name, logo, config, process_metrics, probe_cache[probe_key]))
+        runtime_rows.append((harness_id, name, logo, config, process_metrics, probe_cache[probe_key], pool_connections))
 
     running_count = sum(1 for row in runtime_rows if row[4].get("running"))
     connected_count = sum(1 for row in runtime_rows if row[5].get("label") == "Connecté")
@@ -1691,10 +2627,298 @@ def render_live_harnesses() -> None:
     st.caption(f"Dernière vérification : {datetime.now().astimezone().strftime('%H:%M:%S')}")
 
 
-def render_harnesses() -> None:
+def render_harnesses(base_url: str, api_key: str) -> None:
     st.subheader("Harnesses")
-    st.caption("État local, durée d'exécution et connectivité réelle vers vLLM.")
-    render_live_harnesses()
+    st.caption("État local, durée d'exécution et connectivité réelle vers vLLM. Choisis une instance déployée ou renseigne un endpoint temporaire dans Options vLLM.")
+    pool_store = load_connection_store(VLLM_CONNECTIONS_PATH)
+    catalog_connections = sorted(
+        (connection for connection in pool_store.get("connections", []) if isinstance(connection, dict)),
+        key=lambda connection: str(connection.get("updatedAt") or connection.get("createdAt") or ""),
+        reverse=True,
+    )
+    pool_connections = catalog_connections
+    stale_connections: list[dict[str, Any]] = []
+    if api_key:
+        try:
+            current_pods = cached_runpod_pods(
+                base_url,
+                credential_fingerprint(api_key),
+                api_key,
+            )
+            pool_connections, stale_connections = split_current_and_stale_connections(
+                catalog_connections,
+                current_pods,
+            )
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            st.warning(
+                "Le catalogue vLLM n'a pas pu être comparé aux Pods RunPod. "
+                f"Les entrées locales sont affichées sans vérification : {exc}"
+            )
+    if stale_connections:
+        with st.expander(
+            f"{len(stale_connections)} ancienne(s) instance(s) masquée(s)",
+            icon=":material/archive:",
+        ):
+            st.caption(
+                "Ces Pods n'existent plus chez RunPod. Ils sont exclus des sélecteurs, "
+                "mais leur fiche locale est conservée jusqu'au nettoyage."
+            )
+            for connection in stale_connections:
+                st.markdown(
+                    f"**{connection.get('name') or connection.get('id')}** · "
+                    f"Pod `{connection.get('podId') or 'inconnu'}`"
+                )
+            if st.button(
+                "Nettoyer le catalogue local",
+                icon=":material/delete_sweep:",
+                key="remove_stale_vllm_connections",
+            ):
+                for connection in stale_connections:
+                    remove_connection(pool_store, str(connection.get("id") or ""))
+                save_connection_store(VLLM_CONNECTIONS_PATH, pool_store)
+                st.session_state["stale_connection_feedback"] = (
+                    f"{len(stale_connections)} ancienne(s) instance(s) retirée(s) du catalogue."
+                )
+                st.rerun()
+    stale_feedback = st.session_state.pop("stale_connection_feedback", "")
+    if stale_feedback:
+        st.success(stale_feedback)
+    render_live_harnesses(pool_connections)
+
+
+def sync_openclaw_agent_pool(connections: list[dict[str, Any]]) -> None:
+    current_config = load_json_object(OPENCLAW_CONFIG_PATH)
+    if not current_config:
+        raise RuntimeError(f"Configuration OpenClaw absente ou invalide : {OPENCLAW_CONFIG_PATH}")
+
+    current_providers = nested_value(current_config, "models.providers", {})
+    current_providers = current_providers if isinstance(current_providers, dict) else {}
+    preserved_providers = {
+        provider_id: provider
+        for provider_id, provider in current_providers.items()
+        if not str(provider_id).startswith("vllm-")
+    }
+
+    current_models = nested_value(current_config, "agents.defaults.models", {})
+    current_models = current_models if isinstance(current_models, dict) else {}
+    preserved_models = {
+        model_ref: model_config
+        for model_ref, model_config in current_models.items()
+        if not str(model_ref).startswith("vllm-")
+    }
+
+    current_agents = nested_value(current_config, "agents.list", [])
+    current_agents = current_agents if isinstance(current_agents, list) else []
+    preserved_agents = [
+        agent
+        for agent in current_agents
+        if not isinstance(agent, dict)
+        or not str(agent.get("model") or "").startswith("vllm-")
+    ]
+    generated_providers: dict[str, Any] = {}
+    generated_models: dict[str, Any] = {}
+    generated_agents: list[dict[str, Any]] = []
+    for connection in connections:
+        provider_id = openclaw_provider_id(connection)
+        model_ref = openclaw_model_ref(connection)
+        generated_providers[provider_id] = openclaw_provider_config(connection)
+        generated_models[model_ref] = {}
+        generated_agents.append(
+            {
+                "id": f"agent-{connection_slug(str(connection['id']))}",
+                "name": connection["name"],
+                "model": model_ref,
+            }
+        )
+    set_nested_value(
+        current_config,
+        "models.providers",
+        {**preserved_providers, **generated_providers},
+    )
+    set_nested_value(
+        current_config,
+        "agents.defaults.models",
+        {**preserved_models, **generated_models},
+    )
+    set_nested_value(current_config, "agents.list", [*preserved_agents, *generated_agents])
+    save_json_config(OPENCLAW_CONFIG_PATH, current_config)
+    run_cli("openclaw", ["config", "validate"], timeout=60)
+    load_openclaw_core.clear()
+    load_openclaw_models.clear()
+    load_openclaw_plugins.clear()
+    load_openclaw_skills.clear()
+    load_openclaw_extensions.clear()
+
+
+def render_vllm_connection_pool(base_url: str, api_key: str) -> None:
+    st.divider()
+    st.subheader("Pool vLLM multi-agent")
+    st.caption("Chaque connexion représente un pod/GPU. Les clés restent dans des variables d'environnement Windows, jamais dans le catalogue local.")
+    store = load_connection_store(VLLM_CONNECTIONS_PATH)
+    connections = [connection for connection in store.get("connections", []) if isinstance(connection, dict)]
+    connection_by_id = {str(connection.get("id")): connection for connection in connections if connection.get("id")}
+
+    if connections:
+        rows = []
+        for connection in connections:
+            api_key_present = bool(user_environment_value(str(connection.get("apiKeyEnv") or "")))
+            probe = probe_vllm(
+                str(connection.get("baseUrl") or ""),
+                user_environment_value(str(connection.get("apiKeyEnv") or "")),
+            )
+            rows.append(
+                {
+                    "Connexion": connection.get("name") or connection.get("id"),
+                    "GPU / Pod": connection.get("podId") or "Endpoint externe",
+                    "Modèle": connection.get("model") or "",
+                    "Agent OpenClaw": f"agent-{connection_slug(str(connection.get('id') or 'vllm'))}",
+                    "Clé env": connection.get("apiKeyEnv") or "",
+                    "Clé présente": "Oui" if api_key_present else "Non",
+                    "État": probe.get("label") or "Inconnu",
+                    "Actif": bool(connection.get("enabled", True)),
+                }
+            )
+        st.dataframe(rows, width="stretch", hide_index=True)
+        selected_connection_id = st.selectbox(
+            "Connexion vLLM",
+            list(connection_by_id),
+            format_func=lambda value: str(connection_by_id[value].get("name") or value),
+        )
+    else:
+        selected_connection_id = ""
+        st.info("Aucune connexion vLLM persistante. Ajoute un pod ou un endpoint pour former le pool.")
+
+    add_col, remove_col, sync_col = st.columns([1, 1, 2.5])
+    with add_col:
+        if st.button("Ajouter", icon=":material/add:", key="add_vllm_connection", help="Ajouter un endpoint vLLM au pool"):
+            st.session_state["show_vllm_connection_editor"] = True
+    with remove_col:
+        if st.button(
+            "Retirer",
+            icon=":material/remove:",
+            key="remove_vllm_connection",
+            help="Retirer la connexion du catalogue local",
+            disabled=not selected_connection_id,
+        ):
+            remove_connection(store, selected_connection_id)
+            save_connection_store(VLLM_CONNECTIONS_PATH, store)
+            st.success("Connexion retirée du catalogue local. Les profils OpenClaw déjà générés sont conservés jusqu'à leur prochaine synchronisation.")
+            st.rerun()
+    with sync_col:
+        enabled_connections = [connection for connection in connections if connection.get("enabled", True)]
+        if st.button(
+            "Générer les profils OpenClaw",
+            icon=":material/account_tree:",
+            key="sync_openclaw_agent_pool",
+            type="primary",
+            disabled=not enabled_connections,
+            help="Crée ou met à jour un agent OpenClaw par connexion active",
+        ):
+            missing_keys = [
+                str(connection.get("apiKeyEnv") or "")
+                for connection in enabled_connections
+                if not user_environment_value(str(connection.get("apiKeyEnv") or ""))
+            ]
+            if missing_keys:
+                st.error("Variables de clé manquantes : " + ", ".join(missing_keys))
+            elif not shutil.which("openclaw"):
+                st.error("OpenClaw n'est pas disponible dans le PATH.")
+            else:
+                try:
+                    sync_openclaw_agent_pool(enabled_connections)
+                    st.success("Profils OpenClaw générés. Redémarre le Gateway si ses nouveaux agents n'apparaissent pas immédiatement.")
+                except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                    st.error(f"Synchronisation impossible : {exc}")
+
+    if not st.session_state.get("show_vllm_connection_editor"):
+        return
+
+    st.markdown("#### Ajouter une connexion")
+    source = st.segmented_control(
+        "Source de la connexion",
+        ["Pod RunPod", "Endpoint manuel"],
+        default="Pod RunPod",
+        selection_mode="single",
+        key="vllm_connection_source",
+    ) or "Pod RunPod"
+    available_pods: dict[str, dict[str, Any]] = {}
+    if source == "Pod RunPod" and api_key:
+        try:
+            available_pods = {
+                f"{pod.get('name', 'sans nom')} · {pod.get('id', '')}": pod
+                for pod in cached_runpod_pods(
+                    base_url,
+                    credential_fingerprint(api_key),
+                    api_key,
+                )
+                if pod.get("id")
+            }
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            st.warning(f"Pods RunPod indisponibles : {exc}")
+    if source == "Pod RunPod" and available_pods:
+        pod_label = st.selectbox("Pod source", list(available_pods), key="vllm_connection_pod")
+        selected_pod = available_pods[pod_label]
+        default_name = str(selected_pod.get("name") or "vllm")
+        default_pod_id = str(selected_pod.get("id") or "")
+        default_url = f"{proxy_url(default_pod_id)}/v1"
+        session_credentials = st.session_state.get("vllm_credentials", {}).get(default_pod_id, {})
+        default_model = str(session_credentials.get("VLLM_MODEL") or "")
+    else:
+        default_name = ""
+        default_pod_id = ""
+        default_url = ""
+        default_model = ""
+        if source == "Pod RunPod":
+            st.caption("Saisis une clé RunPod dans la barre latérale ou passe à Endpoint manuel.")
+
+    default_env_name = f"VLLM_{connection_slug(default_name or 'connection').upper().replace('-', '_')}_API_KEY"
+    with st.form("vllm_connection_form", border=False):
+        connection_name = st.text_input("Nom de la connexion", value=default_name, placeholder="qwen-27b-a40")
+        endpoint = st.text_input("Endpoint OpenAI-compatible", value=default_url, placeholder="https://<pod-id>-8000.proxy.runpod.net/v1")
+        model = st.text_input("Modèle exposé par vLLM", value=default_model, placeholder="Qwen/Qwen3-27B")
+        pod_id = st.text_input("ID Pod RunPod", value=default_pod_id)
+        env_name = st.text_input("Variable d'environnement de la clé", value=default_env_name)
+        secret_value = st.text_input(
+            "Clé vLLM à enregistrer",
+            type="password",
+            help="Optionnelle si cette variable existe déjà. Elle est enregistrée dans les variables utilisateur Windows, jamais dans le catalogue.",
+        )
+        context_col, token_col = st.columns(2)
+        with context_col:
+            context_window = st.number_input("Fenêtre de contexte", min_value=1024, value=131072, step=1024)
+        with token_col:
+            max_tokens = st.number_input("Tokens générés maximum", min_value=128, value=4096, step=128)
+        enabled = st.toggle("Connexion active", value=True)
+        save_connection = st.form_submit_button("Enregistrer la connexion", type="primary")
+    if save_connection:
+        if not connection_name.strip() or not endpoint.startswith(("http://", "https://")) or not model.strip():
+            st.error("Le nom, un endpoint HTTP(S) et le modèle sont obligatoires.")
+        elif not env_name.replace("_", "").isalnum() or not env_name.upper() == env_name:
+            st.error("La variable de clé doit contenir uniquement des majuscules, chiffres et underscores.")
+        else:
+            try:
+                if secret_value.strip():
+                    save_user_environment_variable(env_name, secret_value.strip())
+                connection = upsert_connection(
+                    store,
+                    {
+                        "id": connection_name,
+                        "name": connection_name,
+                        "podId": pod_id,
+                        "baseUrl": endpoint,
+                        "model": model,
+                        "apiKeyEnv": env_name,
+                        "contextWindow": int(context_window),
+                        "maxTokens": int(max_tokens),
+                        "enabled": enabled,
+                    },
+                )
+                save_connection_store(VLLM_CONNECTIONS_PATH, store)
+                st.session_state["show_vllm_connection_editor"] = False
+                st.success(f"Connexion {connection['name']} enregistrée.")
+                st.rerun()
+            except OSError as exc:
+                st.error(f"Enregistrement impossible : {exc}")
 
 
 def render_vllm_deploy(base_url: str, api_key: str) -> None:
@@ -1738,7 +2962,11 @@ def render_vllm_deploy(base_url: str, api_key: str) -> None:
     )
     with st.spinner("Récupération des GPU et de leur disponibilité Runpod..."):
         try:
-            gpu_catalog = request_gpu_catalog(api_key, cloud_type)
+            gpu_catalog = cached_gpu_catalog(
+                cloud_type,
+                credential_fingerprint(api_key),
+                api_key,
+            )
         except (requests.RequestException, RuntimeError, ValueError) as exc:
             st.error(f"Impossible de récupérer le catalogue GPU Runpod : {exc}")
             st.info("Vérifie que RUNPOD_API_KEY est valide. La liste des GPU utilise l'API GraphQL Runpod.")
@@ -1843,6 +3071,7 @@ def render_vllm_deploy(base_url: str, api_key: str) -> None:
     )
     try:
         created = request_runpod("POST", base_url, api_key, "/pods", json=payload)
+        clear_runpod_read_caches()
         pod_id = pod_identifier(created)
         if not pod_id:
             st.warning("Runpod a accepté la demande, mais aucun ID de pod n'a été retourné.")
@@ -1850,6 +3079,27 @@ def render_vllm_deploy(base_url: str, api_key: str) -> None:
             return
         credentials = credentials_for(pod_id, model.strip(), vllm_api_key, service_type)
         st.session_state.setdefault("vllm_credentials", {})[pod_id] = credentials
+        if service_type == "text":
+            try:
+                connection_name = name.strip()
+                api_key_env = f"VLLM_{connection_slug(pod_id).upper().replace('-', '_')}_API_KEY"
+                save_user_environment_variable(api_key_env, vllm_api_key)
+                connection_store = load_connection_store(VLLM_CONNECTIONS_PATH)
+                upsert_connection(
+                    connection_store,
+                    {
+                        "id": pod_id,
+                        "name": connection_name,
+                        "podId": pod_id,
+                        "baseUrl": credentials["VLLM_BASE_URL"],
+                        "model": model.strip(),
+                        "apiKeyEnv": api_key_env,
+                        "enabled": True,
+                    },
+                )
+                save_connection_store(VLLM_CONNECTIONS_PATH, connection_store)
+            except OSError as exc:
+                st.warning(f"Pod créé, mais l'instance vLLM n'a pas pu être enregistrée automatiquement : {exc}")
         st.success(f"Déploiement envoyé. Pod : {pod_id}")
         st.caption(f"État initial Runpod : {pod_state(created) if isinstance(created, dict) else 'CREATING'}")
         show_credentials(pod_id, credentials, "created", created if isinstance(created, dict) else None)
@@ -1862,6 +3112,126 @@ def render_vllm_deploy(base_url: str, api_key: str) -> None:
             st.error(f"Déploiement impossible : {exc}")
 
 
+def render_lifecycle_policies(pods: list[dict[str, Any]]) -> None:
+    st.subheader("Protection contre la surfacturation")
+    st.caption(
+        "Les échéances sont enregistrées localement. Une échéance dépassée est rejouée au prochain démarrage du dashboard."
+    )
+    store = load_policy_store(LIFECYCLE_POLICIES_PATH)
+    policies = store.get("policies", {}) if isinstance(store.get("policies"), dict) else {}
+    pods_by_id = {str(pod.get("id")): pod for pod in pods if pod.get("id")}
+    if policies:
+        rows = []
+        for pod_id, policy in policies.items():
+            if not isinstance(policy, dict):
+                continue
+            pod = pods_by_id.get(str(pod_id), {})
+            rows.append(
+                {
+                    "Pod": policy.get("podName") or pod.get("name") or pod_id,
+                    "ID": pod_id,
+                    "État RunPod": pod_state(pod).upper() if pod else "Non trouvé",
+                    "Pause prévue": local_time_text(policy.get("pauseAt")),
+                    "Destruction prévue": local_time_text(policy.get("deleteAt")),
+                    "Pause exécutée": local_time_text(policy.get("pauseCompletedAt")),
+                    "Destruction exécutée": local_time_text(policy.get("deleteCompletedAt")),
+                    "Dernière erreur": policy.get("lastError") or "",
+                }
+            )
+        st.dataframe(rows, width="stretch", hide_index=True)
+
+    pod_options = {
+        f"{pod.get('name', 'sans nom')} · {pod.get('id', '')}": pod
+        for pod in pods
+        if pod.get("id") and pod_state(pod).upper() not in {"TERMINATED", "DELETED"}
+    }
+    active_policies = [
+        pod_id
+        for pod_id, policy in policies.items()
+        if isinstance(policy, dict) and not policy.get("deleteCompletedAt")
+    ]
+    if not pod_options:
+        st.info("Aucun pod disponible pour programmer une protection.")
+        if active_policies:
+            cancel_pod = st.selectbox("Protection à annuler", active_policies, key="cancel_lifecycle_policy")
+            if st.button("Annuler la protection", icon=":material/event_busy:"):
+                clear_policy(store, cancel_pod)
+                save_policy_store(LIFECYCLE_POLICIES_PATH, store)
+                st.success("Protection annulée.")
+                st.rerun()
+        return
+
+    with st.form("pod_lifecycle_form", border=False):
+        selected_label = st.selectbox("Machine à protéger", list(pod_options))
+        pause_enabled = st.toggle("Mettre en pause après un délai", value=True)
+        pause_minutes = st.number_input(
+            "Délai avant mise en pause (minutes)",
+            min_value=1,
+            value=120,
+            step=5,
+            disabled=not pause_enabled,
+        )
+        delete_enabled = st.toggle("Détruire après un délai", value=False)
+        delete_minutes = st.number_input(
+            "Délai avant destruction (minutes)",
+            min_value=1,
+            value=240,
+            step=5,
+            disabled=not delete_enabled,
+        )
+        delete_confirmed = st.checkbox(
+            "Je confirme que la destruction supprime les données hors Network Volume.",
+            disabled=not delete_enabled,
+        )
+        save_policy = st.form_submit_button(
+            "Programmer la protection", icon=":material/schedule:", type="primary"
+        )
+    if save_policy:
+        if not pause_enabled and not delete_enabled:
+            st.error("Choisis au moins une action automatique.")
+            return
+        if delete_enabled and not delete_confirmed:
+            st.error("La confirmation est obligatoire avant de programmer une destruction.")
+            return
+        if pause_enabled and delete_enabled and delete_minutes <= pause_minutes:
+            st.error("Le délai de destruction doit être supérieur au délai de pause.")
+            return
+        selected_pod = pod_options[selected_label]
+        policy = schedule_policy(
+            store,
+            str(selected_pod["id"]),
+            str(selected_pod.get("name") or selected_pod["id"]),
+            int(pause_minutes) if pause_enabled else None,
+            int(delete_minutes) if delete_enabled else None,
+        )
+        save_policy_store(LIFECYCLE_POLICIES_PATH, store)
+        summary = []
+        if policy.get("pauseAt"):
+            summary.append(f"pause {local_time_text(policy['pauseAt'])}")
+        if policy.get("deleteAt"):
+            summary.append(f"destruction {local_time_text(policy['deleteAt'])}")
+        st.success("Protection programmée : " + " · ".join(summary) + ".")
+        st.rerun()
+
+    if active_policies:
+        cancel_pod = st.selectbox("Protection à annuler", active_policies, key="cancel_lifecycle_policy")
+        if st.button("Annuler la protection", icon=":material/event_busy:"):
+            clear_policy(store, cancel_pod)
+            save_policy_store(LIFECYCLE_POLICIES_PATH, store)
+            st.success("Protection annulée.")
+            st.rerun()
+
+
+@st.fragment(run_every=30)
+def run_lifecycle_guard(base_url: str, api_key: str) -> None:
+    for event in reconcile_lifecycle_policies(base_url, api_key):
+        if event["kind"] == "success":
+            st.toast(event["message"], icon=":material/schedule:")
+        else:
+            st.warning(event["message"])
+
+
+@st.fragment(run_every=15)
 def render_machines(base_url: str, api_key: str) -> None:
     if not api_key:
         st.info("Définis RUNPOD_API_KEY ou saisis une clé dans la barre latérale pour charger les machines.")
@@ -1871,6 +3241,8 @@ def render_machines(base_url: str, api_key: str) -> None:
     refresh_col, filter_col = st.columns([1, 3])
     with refresh_col:
         if st.button("Actualiser"):
+            cached_runpod_pods.clear()
+            cached_probe_vllm.clear()
             st.rerun()
     with filter_col:
         state_filter = st.selectbox(
@@ -1880,10 +3252,23 @@ def render_machines(base_url: str, api_key: str) -> None:
         )
 
     try:
-        pods = response_items(request_runpod("GET", base_url, api_key, "/pods"))
+        all_pods = cached_runpod_pods(
+            base_url,
+            credential_fingerprint(api_key),
+            api_key,
+        )
     except (requests.RequestException, RuntimeError, ValueError) as exc:
         st.error(f"Impossible de charger les machines : {exc}")
-        pods = []
+        all_pods = []
+
+    lifecycle_events = reconcile_lifecycle_policies(base_url, api_key, all_pods)
+    for event in lifecycle_events:
+        if event["kind"] == "success":
+            st.success(event["message"])
+        else:
+            st.error(event["message"])
+
+    pods = list(all_pods)
 
     if state_filter != "Tous":
         pods = [pod for pod in pods if pod_state(pod).upper() == state_filter]
@@ -1912,11 +3297,42 @@ def render_machines(base_url: str, api_key: str) -> None:
         ]
         st.dataframe(rows, width="stretch", hide_index=True)
 
-        st.subheader("État des modèles vLLM")
         credentials_by_pod = st.session_state.get("vllm_credentials", {})
+        starting_pods = [
+            pod
+            for pod in pods
+            if pod_state(pod).upper() not in {"RUNNING", "READY", "STOPPED", "EXITED", "TERMINATED", "ERROR"}
+        ]
+        if starting_pods:
+            st.subheader("Démarrage des machines")
+            st.caption("Actualisation automatique toutes les 15 secondes.")
+            for pod in starting_pods:
+                pod_id = str(pod.get("id", ""))
+                credentials = credentials_by_pod.get(pod_id) or saved_vllm_credentials(pod_id)
+                status = vllm_health(pod, credentials)
+                with st.container(border=True):
+                    title_col, state_col = st.columns([3, 1])
+                    with title_col:
+                        st.markdown(f"**{pod.get('name', pod_id)}**")
+                        st.caption(f"{pod_gpu_count(pod)} x {pod_gpu_name(pod)} · {pod.get('imageName') or pod.get('image') or 'Image non remontée'}")
+                    with state_col:
+                        st.markdown(status_badge(status), unsafe_allow_html=True)
+                    info_cols = st.columns(5)
+                    info_cols[0].metric("État RunPod", pod_state(pod).upper() or "Inconnu")
+                    info_cols[1].metric("État demandé", str(pod.get("desiredStatus") or "RUNNING"))
+                    info_cols[2].metric("Modèle", str((credentials or {}).get("VLLM_MODEL") or "Non enregistré"))
+                    info_cols[3].metric("Démarrage depuis", pod_runtime_text(pod))
+                    info_cols[4].metric("Coût", usd(pod_hourly_cost(pod), "/h"))
+                    last_started = str(pod.get("lastStartedAt") or "En attente")
+                    lifecycle_event = str(pod.get("lastStatusChange") or "Aucun événement détaillé remonté")
+                    st.caption(f"Dernier démarrage : {last_started} · RunPod : {lifecycle_event}")
+                    st.caption(f"Endpoint : {proxy_url(pod_id)}/v1 · vLLM : {status['detail']}")
+
+        st.subheader("État des modèles vLLM")
         for pod in pods:
             pod_id = str(pod.get("id", ""))
-            status = vllm_health(pod, credentials_by_pod.get(pod_id))
+            credentials = credentials_by_pod.get(pod_id) or saved_vllm_credentials(pod_id)
+            status = vllm_health(pod, credentials)
             status_col, detail_col = st.columns([1, 3])
             with status_col:
                 st.markdown(
@@ -1925,6 +3341,7 @@ def render_machines(base_url: str, api_key: str) -> None:
                 )
             with detail_col:
                 st.caption(status["detail"])
+                st.caption(f"Runtime : {pod_runtime_text(pod)}")
 
         pod_options = {
             f"{pod.get('name', 'sans nom')} · {pod.get('id', '')}": pod.get("id", "")
@@ -1946,27 +3363,27 @@ def render_machines(base_url: str, api_key: str) -> None:
             st.metric("Coût de la machine", usd(pod_hourly_cost(selected_pod), "/h"))
         action_col, confirm_col = st.columns([1, 3])
         with action_col:
-            action = st.selectbox("Action", ["terminate", "delete"], label_visibility="collapsed")
+            action_labels = {"Mettre en pause": "stop", "Détruire": "delete"}
+            action_label = st.selectbox("Action", list(action_labels), label_visibility="collapsed")
         with confirm_col:
             confirmed = st.checkbox("Je confirme l'action sur cette machine")
         if st.button("Exécuter l'action", type="secondary", disabled=not confirmed):
             try:
+                action = action_labels[action_label]
                 if action == "delete":
                     request_runpod("DELETE", base_url, api_key, f"/pods/{selected_id}")
                 else:
-                    request_runpod(
-                        "POST",
-                        base_url,
-                        api_key,
-                        f"/pods/{selected_id}/terminate",
-                        json={"reason": "requested_via_dashboard"},
-                    )
-                st.success(f"Action {action} envoyée pour {selected_id}.")
+                    request_runpod("POST", base_url, api_key, f"/pods/{selected_id}/stop")
+                clear_runpod_read_caches()
+                st.success(f"Action {action_label.lower()} envoyée pour {selected_id}.")
                 st.rerun()
             except (requests.RequestException, RuntimeError, ValueError) as exc:
                 st.error(f"Action impossible : {exc}")
     else:
         st.info("Aucune machine ne correspond au filtre sélectionné.")
+
+    st.divider()
+    render_lifecycle_policies(all_pods)
 
     credentials = st.session_state.get("vllm_credentials", {})
     if credentials:
@@ -2665,21 +4082,21 @@ def render_configuration(base_url: str, env_api_key: str) -> None:
         if st.button("Actualiser", icon=":material/refresh:", key="refresh_configuration"):
             load_openclaw_schema.clear()
             load_openclaw_models.clear()
+            load_openclaw_core.clear()
             load_openclaw_plugins.clear()
             load_openclaw_skills.clear()
+            load_openclaw_extensions.clear()
             st.rerun()
     with security_col:
         st.caption("Les clés, tokens, mots de passe et credentials sont exclus des tableaux de configuration.")
 
     requested_openclaw_section = st.session_state.get("openclaw_configuration_section", "Modèle")
     load_extensions = requested_openclaw_section == "Plugins, skills et MCP"
-    with st.spinner("Lecture du schéma et des modèles OpenClaw..."):
-        schema, schema_error = load_openclaw_schema()
-        models, model_status, model_error = load_openclaw_models()
+    with st.spinner("Lecture parallèle du schéma et des modèles OpenClaw..."):
+        schema, schema_error, models, model_status, model_error = load_openclaw_core()
     if load_extensions:
-        with st.spinner("Lecture des plugins et skills OpenClaw..."):
-            plugins, plugin_error = load_openclaw_plugins()
-            skills, skill_error = load_openclaw_skills()
+        with st.spinner("Lecture parallèle des plugins et skills OpenClaw..."):
+            plugins, plugin_error, skills, skill_error = load_openclaw_extensions()
     else:
         plugins, plugin_error = [], ""
         skills, skill_error = [], ""
@@ -2811,6 +4228,9 @@ def main() -> None:
     st.title("RunPod Control Center")
     st.caption("Infrastructure GPU · coûts · modèles")
     st.markdown('<div class="dashboard-rule"></div>', unsafe_allow_html=True)
+    requested_page = str(st.session_state.get("main_navigation") or "Vue d'ensemble")
+    preload_executor: ThreadPoolExecutor | None = None
+    preload_futures: dict[str, Any] = {}
 
     with st.sidebar:
         st.header("Connexion")
@@ -2827,6 +4247,11 @@ def main() -> None:
             st.caption("Clé préremplie depuis RUNPOD_API_KEY.")
         else:
             st.caption("Aucune clé d'environnement détectée.")
+        preload_executor, preload_futures = prefetch_runpod_data(
+            base_url,
+            api_key,
+            requested_page,
+        )
         if api_key and st.button("Enregistrer la clé dans Windows"):
             try:
                 import winreg
@@ -2848,7 +4273,7 @@ def main() -> None:
         account_error = ""
         if api_key:
             try:
-                account = request_account_summary(api_key)
+                account = preload_futures["account"].result()
             except (requests.RequestException, RuntimeError, ValueError) as exc:
                 account_error = str(exc)
 
@@ -2861,6 +4286,8 @@ def main() -> None:
             st.caption("Informations financières indisponibles pour cette clé.")
         else:
             st.caption("En attente d'une clé API.")
+
+    run_lifecycle_guard(base_url, api_key)
 
     pages = ["Vue d'ensemble", "Machines", "Harnesses", "Déployer vLLM", "Templates", "Configuration"]
     page = st.segmented_control(
@@ -2878,13 +4305,15 @@ def main() -> None:
     elif page == "Machines":
         render_machines(base_url, api_key)
     elif page == "Harnesses":
-        render_harnesses()
+        render_harnesses(base_url, api_key)
     elif page == "Déployer vLLM":
         render_vllm_deploy(base_url, api_key)
     elif page == "Templates":
         render_templates()
     else:
         render_configuration(base_url, env_api_key)
+    if preload_executor:
+        preload_executor.shutdown(wait=False)
 
 
 if __name__ == "__main__":

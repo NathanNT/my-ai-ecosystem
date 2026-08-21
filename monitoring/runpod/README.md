@@ -49,16 +49,17 @@ Supprime par nom (si unique) :
 .\powershell\delete-runpod.ps1 -PodIdentifier "my-a40-vllm"
 ```
 
-### 4) Arrêt logique via action terminate
+### 4) Mettre une machine en pause
 
-Selon les droits/versions d'API, le stop réel peut être un `DELETE` ou un `POST /terminate`.
-Le script supporte les deux :
+La pause libère le GPU et conserve le Volume Disk. RunPod facture toujours le stockage du volume tant que le Pod existe : utilise `delete` lorsque tu ne veux plus conserver la machine.
 
 ```powershell
-.\powershell\delete-runpod.ps1 -PodIdentifier 123abc -Action terminate
+.\powershell\delete-runpod.ps1 -PodIdentifier 123abc -Action stop
 ```
 
 ## Dashboard Streamlit (recommandé)
+
+The `Machines` view refreshes automatically every 15 seconds. While a Pod is starting, it shows its RunPod state, requested state, GPU, image, saved model metadata, hourly cost, endpoint, and the latest lifecycle event. vLLM health is checked as soon as its locally stored API-key variable is available.
 
 Le dashboard local regroupe les machines, les templates JSON et les actions de création, terminaison et suppression dans une seule interface. Il ne stocke pas la clé API.
 
@@ -86,21 +87,23 @@ Le dashboard utilise un thème sombre local et ouvre sur une vue d'ensemble qui 
 
 La lecture du solde utilise l'API GraphQL RunPod. Avec une clé à permissions restreintes, autorise la lecture du compte et de la facturation ; le pilotage des Pods reste disponible même si les informations financières sont refusées.
 
-### Superviser les harnesses
+### Harness monitoring
 
-La page `Harnesses` surveille automatiquement OpenClaw et Qwen Code toutes les dix secondes. Elle affiche pour chacun :
+The `Harnesses` page refreshes OpenClaw and Qwen Code every ten seconds. Each card shows the active connection, model, endpoint, vLLM health, process uptime, memory usage, and latency. Start, stop, and restart controls operate only on the detected harness processes.
 
-- le nombre de processus locaux, leur mémoire et leur durée d'exécution ;
-- le fichier de configuration détecté et le modèle sélectionné ;
-- l'endpoint vLLM réellement utilisé, son état et sa latence ;
-- les modèles retournés par `/v1/models` et leur cohérence avec le modèle du harness ;
-- l'état du Gateway local OpenClaw sur son port configuré.
+`Options vLLM` separates saved RunPod instances from manual configuration. Selecting a different instance only creates a pending selection; the active connection does not change until `Apply and restart` is used. Before replacing a running harness, the dashboard calls the selected endpoint's `/models` route with the selected API key and verifies that the configured model is served. A failed endpoint, rejected key, or mismatched model prevents the restart.
 
-Chaque carte permet aussi de démarrer le harness dans une nouvelle console Windows ou d'arrêter uniquement ses processus détectés. Le bouton `Options vLLM` accepte un endpoint, une clé et un modèle temporaires, avec redémarrage optionnel pour appliquer immédiatement la connexion. Ces valeurs restent dans la session Streamlit : elles ne modifient ni `openclaw.json`, ni `settings.json`, ni les variables d'environnement Windows.
+RunPod reads are preloaded concurrently and shared across pages. Pod inventory is cached for 15 seconds, account data for 60 seconds, billing for five minutes, GPU availability for 60 seconds, vLLM health for 12 seconds, and the local process inventory for 15 seconds. Manual refreshes and every create, stop, or delete action invalidate the relevant caches immediately. API keys are excluded from Streamlit cache keys; only their SHA-256 fingerprints identify separate cache entries. OpenClaw device-pairing requests are loaded only when their refresh button is used.
 
-Pour OpenClaw, l'endpoint et la clé sont injectés via `VLLM_BASE_URL` et `VLLM_API_KEY`; le modèle reste celui déclaré dans `openclaw.json`. Pour Qwen Code, le dashboard transmet `OPENAI_BASE_URL`, `OPENAI_API_KEY` et `OPENAI_MODEL` au nouveau processus.
+For OpenClaw, applying an instance updates the explicit `vllm` provider and primary model in `openclaw.json`. The selected per-Pod secret remains in its dedicated Windows variable, while the dashboard synchronizes the active value to both `VLLM_API_KEY` and OpenClaw's higher-priority `vllm:default` auth profile. The key is then injected explicitly into every Gateway process launched by the dashboard. On Windows, harness processes also receive `NODE_USE_SYSTEM_CA=1` so Node.js trusts the Windows certificate store without disabling TLS verification. Qwen Code receives `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `OPENAI_MODEL` in its process environment.
 
-Les configurations sont lues depuis `%USERPROFILE%\.openclaw\openclaw.json`, `%USERPROFILE%\.qwen\settings.json`, les arguments du processus Qwen Code et les variables `VLLM_BASE_URL`, `VLLM_API_KEY` et `VLLM_MODEL`. Les clés servent uniquement à sonder l'endpoint et ne sont jamais affichées dans l'interface.
+### Pool vLLM multi-agent
+
+Every text vLLM Pod created from `Déployer vLLM` is automatically registered as a selectable instance. Its endpoint, model, and a dedicated Windows API-key variable are saved locally, outside Git. The `Harnesses` page compares this catalog with the live RunPod inventory: deleted Pods are hidden from selectors and can be removed from the local catalog in one click.
+
+In OpenClaw's `Options vLLM`, select one primary instance and zero or more additional instances. The primary instance becomes the default `vllm` model. Each additional instance creates a dedicated provider and agent in `openclaw.json`, with its own environment-backed API key. Applying the selection validates every endpoint and restarts the Gateway when it is already running. Qwen Code supports one vLLM connection per CLI process, so its selector remains single-choice.
+
+The local instance catalog is stored in `monitoring/runpod/data/vllm-connections.json` and is ignored by Git. It contains endpoint and model metadata plus the name of the Windows variable that holds the API key; the key itself is never written to the catalog.
 
 ### Configurer les modèles et les harnesses
 
@@ -119,13 +122,23 @@ Les changements OpenClaw passent par `openclaw config patch --stdin`, puis `open
 
 Les chemins contenant une clé, un token, un mot de passe, un secret ou des credentials sont exclus de l'explorateur avancé. Le bouton `Actualiser` vide le cache d'inventaire et relit le schéma, les modèles, les plugins et les skills installés.
 
+Pour garder l'interface réactive, le schéma, la liste des modèles et leur statut sont lus en parallèle puis conservés cinq minutes en cache. Les plugins et les skills ne sont demandés que lorsque leur section est ouverte, et sont eux aussi lus en parallèle.
+
 Références : [configuration OpenClaw](https://docs.openclaw.ai/gateway/configuration), [référence complète OpenClaw](https://docs.openclaw.ai/gateway/configuration-reference) et [settings Qwen Code](https://github.com/QwenLM/qwen-code/blob/main/docs/users/configuration/settings.md).
 
 Les logos locaux du dashboard proviennent des sites officiels [OpenClaw](https://openclaw.ai/) et [Qwen](https://qwenlm.github.io/).
 
 Tu peux aussi saisir la clé dans la barre latérale puis cliquer sur `Enregistrer la clé dans Windows`. Elle sera enregistrée comme variable d'environnement utilisateur `RUNPOD_API_KEY` dans Windows. Les nouveaux terminaux et les prochains lancements de Streamlit la récupéreront automatiquement ; la valeur reste stockée localement en clair par Windows comme toute variable d'environnement.
 
-Les templates éditables sont dans `monitoring/runpod/templates/`. Le bouton `terminate` est l'action à privilégier pour arrêter une machine ; `delete` est conservé comme action explicite et demande une confirmation dans l'interface.
+Les templates éditables sont dans `monitoring/runpod/templates/`. Le bouton `Mettre en pause` appelle `POST /pods/{id}/stop` et le bouton `Détruire` appelle `DELETE /pods/{id}`. La destruction demande une confirmation dans l'interface.
+
+### Protection automatique contre la surfacturation
+
+Dans `Machines`, la section `Protection contre la surfacturation` permet de programmer, pour chaque Pod, un délai de pause, un délai de destruction, ou les deux. Les deux délais sont calculés à partir de l'enregistrement de la règle ; si les deux sont utilisés, la destruction doit être postérieure à la pause.
+
+Les règles sont enregistrées hors Git dans `monitoring/runpod/data/pod-lifecycle.json` et ne contiennent aucune clé API. Le dashboard les contrôle toutes les 30 secondes tant qu'il est ouvert. Après un redémarrage, les règles et leurs dates absolues sont relues ; une action échue est demandée immédiatement. Les erreurs RunPod sont mémorisées dans la règle et réessayées au contrôle suivant.
+
+Une pause conserve le Volume Disk mais pas le Container Disk, et peut encore produire des frais de stockage. Une destruction est définitive pour toutes les données hors Network Volume. La protection ne peut évidemment pas déclencher une action pendant que le PC et le dashboard sont complètement arrêtés ; au prochain lancement, elle rattrape l'échéance sans la perdre.
 
 ### Déployer vLLM et récupérer les credentials
 
