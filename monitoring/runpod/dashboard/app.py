@@ -151,6 +151,9 @@ def build_vllm_payload(
     network_volume_id: str,
     volume_gb: int,
     container_disk_gb: int,
+    image_name: str = "vllm/vllm-openai:latest",
+    extra_start_args: list[str] | None = None,
+    template_env: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     env = {
         "MODEL_ID": model,
@@ -161,6 +164,11 @@ def build_vllm_payload(
         env["HF_TOKEN"] = hf_token
     if service_type == "asr":
         env["VLLM_MAX_AUDIO_CLIP_FILESIZE_MB"] = "25"
+    for key, value in (template_env or {}).items():
+        if key in {"MODEL_ID", "VLLM_API_KEY", "HF_TOKEN"}:
+            continue
+        if isinstance(value, str) and not value.startswith("<"):
+            env[key] = value
 
     payload: dict[str, Any] = {
         "name": name,
@@ -168,7 +176,7 @@ def build_vllm_payload(
         "gpuCount": 1,
         "gpuTypeIds": gpu_types,
         "gpuTypePriority": "availability",
-        "imageName": "vllm/vllm-openai:latest",
+        "imageName": image_name,
         "containerDiskInGb": container_disk_gb,
         "volumeInGb": volume_gb,
         "volumeMountPath": "/workspace",
@@ -183,13 +191,47 @@ def build_vllm_payload(
             str(VLLM_PORT),
             "--api-key",
             vllm_api_key,
-        ],
+        ] + list(extra_start_args or []),
     }
     if cloud_type == "COMMUNITY":
         payload["supportPublicIp"] = True
     if network_volume_id.strip():
         payload["networkVolumeId"] = network_volume_id.strip()
     return payload
+
+
+def template_start_args(template: dict[str, Any] | None) -> list[str]:
+    """Keep template-specific vLLM flags while regenerating connection arguments."""
+    if not template or not isinstance(template.get("dockerStartCmd"), list):
+        return []
+    ignored_flags = {"--model", "--host", "--port", "--api-key"}
+    args: list[str] = []
+    skip_value = False
+    for raw_arg in template["dockerStartCmd"]:
+        arg = str(raw_arg)
+        if skip_value:
+            skip_value = False
+            continue
+        if arg in ignored_flags:
+            skip_value = True
+            continue
+        args.append(arg)
+    return args
+
+
+def template_gpu_ids(template: dict[str, Any] | None) -> list[str]:
+    if not template:
+        return []
+    values = template.get("gpuTypeIds")
+    if isinstance(values, list):
+        return [str(value) for value in values if value]
+    value = template.get("gpuTypeId")
+    return [str(value)] if value else []
+
+
+def template_default_value(template: dict[str, Any] | None, key: str, fallback: Any) -> Any:
+    value = template.get(key) if template else None
+    return fallback if value is None or (isinstance(value, str) and value.startswith("<")) else value
 
 
 def credentials_for(pod_id: str, model: str, vllm_api_key: str, service_type: str = "text") -> dict[str, str]:
@@ -308,7 +350,23 @@ def show_credentials(pod_id: str, credentials: dict[str, str], key_suffix: str, 
 
 def render_vllm_deploy(base_url: str, api_key: str) -> None:
     st.subheader("Déployer vLLM")
-    service_label = st.selectbox("Service à déployer", ["Génération texte", "Transcription vocale"])
+    templates = load_templates()
+    template_choices = {"Configuration manuelle": None}
+    template_choices.update({name: name for name in templates})
+    selected_template_name = st.selectbox("Template de déploiement", list(template_choices))
+    selected_template = templates.get(template_choices[selected_template_name])
+    template_key = selected_template_name.lower().replace(" ", "_")
+    if selected_template:
+        st.caption("Les champs ci-dessous sont préremplis depuis cette template et restent modifiables.")
+
+    template_service_type = str((selected_template or {}).get("serviceType", "")).lower()
+    default_service_index = 1 if template_service_type == "asr" else 0
+    service_label = st.selectbox(
+        "Service à déployer",
+        ["Génération texte", "Transcription vocale"],
+        index=default_service_index,
+        key=f"deploy_service_{template_key}",
+    )
     service_type = "asr" if service_label == "Transcription vocale" else "text"
     st.caption(
         "Le modèle audio sera exposé sur /v1/audio/transcriptions."
@@ -319,9 +377,14 @@ def render_vllm_deploy(base_url: str, api_key: str) -> None:
         st.info("Définis d'abord RUNPOD_API_KEY ou saisis ta clé Runpod dans la barre latérale.")
         return
 
+    template_cloud_type = str((selected_template or {}).get("cloudType", "SECURE"))
+    cloud_options = ["SECURE", "COMMUNITY"]
+    cloud_index = cloud_options.index(template_cloud_type) if template_cloud_type in cloud_options else 0
     cloud_type = st.selectbox(
         "Type de cloud",
-        ["SECURE", "COMMUNITY"],
+        cloud_options,
+        index=cloud_index,
+        key=f"deploy_cloud_{template_key}",
         help="COMMUNITY offre souvent davantage de capacité, mais repose sur des fournisseurs communautaires.",
     )
     with st.spinner("Récupération des GPU et de leur disponibilité Runpod..."):
@@ -340,34 +403,71 @@ def render_vllm_deploy(base_url: str, api_key: str) -> None:
     if not gpu_options:
         st.warning("Runpod n'a retourné aucun GPU pour ce cloud.")
         return
-    default_gpu = next((label for label in gpu_options if "A40" in label), next(iter(gpu_options)))
+    preferred_gpu_ids = template_gpu_ids(selected_template)
+    template_gpu_labels = [
+        label for preferred_id in preferred_gpu_ids for label, gpu_id in gpu_options.items() if gpu_id == preferred_id
+    ]
+    default_gpu_labels = template_gpu_labels or [
+        next((label for label in gpu_options if "A40" in label), next(iter(gpu_options)))
+    ]
     selected_gpu_labels = st.multiselect(
         "GPU(s), dans l'ordre de préférence",
         options=list(gpu_options),
-        default=[default_gpu],
+        default=default_gpu_labels,
+        key=f"deploy_gpu_{template_key}",
         help="Les GPU sélectionnés sont envoyés à Runpod dans cet ordre. Leur disponibilité est récupérée en direct.",
     )
     selected_gpu_ids = [gpu_options[label] for label in selected_gpu_labels]
     st.caption("Les prix et états affichés proviennent du catalogue Runpod au moment du chargement.")
 
     with st.form("vllm_deploy_form"):
-        name = st.text_input("Nom du pod", value="vllm-a40")
-        default_model = "openai/whisper-large-v3-turbo" if service_type == "asr" else "Qwen/Qwen3-8B"
-        model = st.text_input("Modèle Hugging Face", value=default_model)
+        name = st.text_input(
+            "Nom du pod",
+            value=str(template_default_value(selected_template, "name", "vllm-a40")),
+            key=f"deploy_name_{template_key}",
+        )
+        template_env = (selected_template or {}).get("env", {})
+        if not isinstance(template_env, dict):
+            template_env = {}
+        default_model = template_env.get("MODEL_ID")
+        if not isinstance(default_model, str) or default_model.startswith("<"):
+            default_model = "openai/whisper-large-v3-turbo" if service_type == "asr" else "Qwen/Qwen3-8B"
+        model = st.text_input("Modèle Hugging Face", value=default_model, key=f"deploy_model_{template_key}")
+        default_hf_token = template_env.get("HF_TOKEN", "")
+        if not isinstance(default_hf_token, str) or default_hf_token.startswith("<"):
+            default_hf_token = ""
         hf_token = st.text_input(
             "Token Hugging Face (optionnel)",
+            value=default_hf_token,
             type="password",
+            key=f"deploy_hf_token_{template_key}",
             help="Nécessaire uniquement pour un modèle privé ou soumis à une licence Hugging Face.",
         )
         network_volume_id = st.text_input(
             "Network volume ID (optionnel)",
+            value=str(template_default_value(selected_template, "networkVolumeId", "")),
+            key=f"deploy_network_volume_{template_key}",
             help="Recommandé pour conserver le cache du modèle entre plusieurs pods.",
         )
+        default_container_disk = int(template_default_value(selected_template, "containerDiskInGb", 50))
+        default_volume = int(template_default_value(selected_template, "volumeInGb", 100))
         disk_col, volume_col = st.columns(2)
         with disk_col:
-            container_disk_gb = st.number_input("Disque conteneur (GB)", min_value=20, value=50, step=10)
+            container_disk_gb = st.number_input(
+                "Disque conteneur (GB)",
+                min_value=20,
+                value=max(20, default_container_disk),
+                step=10,
+                key=f"deploy_container_disk_{template_key}",
+            )
         with volume_col:
-            volume_gb = st.number_input("Volume de travail (GB)", min_value=20, value=100, step=10)
+            volume_gb = st.number_input(
+                "Volume de travail (GB)",
+                min_value=20,
+                value=max(20, default_volume),
+                step=10,
+                key=f"deploy_volume_{template_key}",
+            )
         submitted = st.form_submit_button("Créer le pod vLLM", type="primary", disabled=not selected_gpu_ids)
 
     if not submitted:
@@ -388,6 +488,9 @@ def render_vllm_deploy(base_url: str, api_key: str) -> None:
         network_volume_id=network_volume_id,
         volume_gb=int(volume_gb),
         container_disk_gb=int(container_disk_gb),
+        image_name=str(template_default_value(selected_template, "imageName", "vllm/vllm-openai:latest")),
+        extra_start_args=template_start_args(selected_template),
+        template_env=template_env,
     )
     try:
         created = request_runpod("POST", base_url, api_key, "/pods", json=payload)

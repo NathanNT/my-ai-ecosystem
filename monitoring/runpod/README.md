@@ -82,7 +82,7 @@ Les templates éditables sont dans `monitoring/runpod/templates/`. Le bouton `te
 
 ### Déployer vLLM et récupérer les credentials
 
-Dans l'onglet `Déployer vLLM`, choisis d'abord le service `Génération texte` ou `Transcription vocale`, puis renseigne :
+Dans l'onglet `Déployer vLLM`, choisis une template ou `Configuration manuelle`. Une template préremplit le nom, le service, le cloud, les GPU disponibles, le modèle, le stockage et les options de démarrage vLLM ; tu peux encore modifier ces valeurs avant de créer le pod. Pour une configuration manuelle, choisis ensuite le service `Génération texte` ou `Transcription vocale`, puis renseigne :
 
 - l'identifiant du modèle Hugging Face, par exemple `Qwen/Qwen3-8B` ;
 - le type de cloud (`SECURE` ou `COMMUNITY`) ;
