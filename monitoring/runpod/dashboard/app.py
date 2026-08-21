@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import base64
+import copy
+import html
 import json
 import os
 import secrets
+import shutil
 import socket
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,6 +26,74 @@ ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 DEFAULT_API_BASE_URL = "https://rest.runpod.io/v1"
 VLLM_PORT = 8000
 ACTIVE_POD_STATES = {"RUNNING", "READY", "STARTING", "CREATING"}
+OPENCLAW_CONFIG_PATH = Path.home() / ".openclaw" / "openclaw.json"
+QWEN_CONFIG_PATH = Path.home() / ".qwen" / "settings.json"
+SENSITIVE_CONFIG_WORDS = {
+    "apikey",
+    "api_key",
+    "auth",
+    "credential",
+    "header",
+    "mcpservers",
+    "password",
+    "secret",
+    "token",
+}
+
+QWEN_SETTING_SPECS = [
+    {"path": "model.name", "type": "string", "description": "Modele principal."},
+    {
+        "path": "model.reasoningEffort",
+        "type": "enum",
+        "choices": ["low", "medium", "high", "xhigh", "max"],
+        "description": "Niveau d'effort de raisonnement, si le modele le supporte.",
+    },
+    {"path": "model.fastModel", "type": "string", "description": "Petit modele auxiliaire pour les suggestions et la speculation."},
+    {"path": "model.advisorModel", "type": "string", "description": "Modele utilise par l'advisor."},
+    {"path": "model.visionModel", "type": "string", "description": "Modele de vision auxiliaire."},
+    {"path": "model.compactionModel", "type": "string", "description": "Modele utilise pour compacter le contexte."},
+    {"path": "model.imageModel", "type": "string", "description": "Modele de generation d'images."},
+    {"path": "model.voiceModel", "type": "string", "description": "Modele vocal auxiliaire."},
+    {"path": "model.modelFallbacks", "type": "array", "description": "Modeles de repli, dans l'ordre."},
+    {"path": "model.generationConfig.timeout", "type": "integer", "description": "Timeout des requetes modele."},
+    {"path": "model.generationConfig.maxRetries", "type": "integer", "description": "Nombre maximal de nouvelles tentatives."},
+    {"path": "model.generationConfig.contextWindowSize", "type": "integer", "description": "Taille de fenetre de contexte declaree."},
+    {"path": "model.generationConfig.enableCacheControl", "type": "boolean", "description": "Active les controles de cache fournisseur."},
+    {"path": "model.generationConfig.splitToolMedia", "type": "boolean", "description": "Separe les medias produits par les outils."},
+    {"path": "model.generationConfig.samplingParams.temperature", "type": "number", "description": "Temperature d'echantillonnage."},
+    {"path": "model.generationConfig.samplingParams.top_p", "type": "number", "description": "Nucleus sampling."},
+    {"path": "model.generationConfig.samplingParams.max_tokens", "type": "integer", "description": "Nombre maximal de tokens generes."},
+    {"path": "model.generationConfig.extra_body.enable_thinking", "type": "boolean", "description": "Active le mode thinking pour les modeles Qwen compatibles."},
+    {"path": "model.maxSessionTurns", "type": "integer", "description": "Nombre maximal de tours dans une session."},
+    {"path": "model.sessionTokenLimit", "type": "integer", "description": "Budget de tokens maximal de la session."},
+    {"path": "model.maxWallTimeSeconds", "type": "integer", "description": "Duree maximale de la session."},
+    {"path": "model.maxToolCalls", "type": "integer", "description": "Nombre maximal d'appels d'outils par session."},
+    {"path": "model.maxToolCallsPerTurn", "type": "integer", "description": "Nombre maximal d'appels d'outils par tour."},
+    {"path": "model.maxSubagentDepth", "type": "integer", "description": "Profondeur maximale des sous-agents."},
+    {"path": "model.skipLoopDetection", "type": "boolean", "description": "Desactive la detection de boucle."},
+    {"path": "model.skipStartupContext", "type": "boolean", "description": "Ignore le contexte de demarrage."},
+    {"path": "context.autoCompactThreshold", "type": "number", "description": "Seuil de compaction automatique du contexte."},
+    {"path": "context.includeDirectories", "type": "array", "description": "Dossiers supplementaires inclus dans le contexte."},
+    {"path": "tools.approvalMode", "type": "enum", "choices": ["plan", "default", "auto-edit", "auto", "yolo"], "description": "Politique d'approbation des outils."},
+    {"path": "tools.useRipgrep", "type": "boolean", "description": "Utilise ripgrep pour les recherches."},
+    {"path": "tools.toolSearch.enabled", "type": "boolean", "description": "Active la recherche dynamique d'outils."},
+    {"path": "tools.computerUse.enabled", "type": "boolean", "description": "Active les outils de controle de l'ordinateur."},
+    {"path": "security.folderTrust.enabled", "type": "boolean", "description": "Active la confiance explicite des dossiers."},
+    {"path": "general.vimMode", "type": "boolean", "description": "Active les raccourcis Vim."},
+    {"path": "general.enableAutoUpdate", "type": "boolean", "description": "Active les mises a jour automatiques."},
+    {"path": "general.enableRecap", "type": "boolean", "description": "Genere un recapitulatif de session."},
+    {"path": "general.enableGitCoauthor", "type": "boolean", "description": "Ajoute Qwen comme co-auteur Git."},
+    {"path": "ui.showLineNumbers", "type": "boolean", "description": "Affiche les numeros de ligne."},
+    {"path": "ui.showCitations", "type": "boolean", "description": "Affiche les citations."},
+    {"path": "ui.showFollowupSuggestions", "type": "boolean", "description": "Affiche les suggestions de suivi."},
+    {"path": "ui.showTokenUsage", "type": "boolean", "description": "Affiche l'utilisation des tokens."},
+    {"path": "ui.showTokensPerSecond", "type": "boolean", "description": "Affiche le debit de tokens."},
+    {"path": "ui.showStatusInTitle", "type": "boolean", "description": "Affiche l'etat dans le titre du terminal."},
+    {"path": "telemetry.enabled", "type": "boolean", "description": "Active la telemetrie Qwen Code."},
+    {"path": "skills.disabled", "type": "array", "description": "Skills desactives explicitement."},
+    {"path": "skills.disabledLevels", "type": "array", "description": "Niveaux de skills desactives."},
+    {"path": "mcpServers", "type": "object", "description": "Serveurs MCP declares dans Qwen Code."},
+]
 
 
 def api_url(base_url: str, path: str) -> str:
@@ -183,6 +255,291 @@ def load_json_object(path: Path) -> dict[str, Any]:
         return {}
 
 
+def executable_path(name: str) -> str:
+    executable = shutil.which(name)
+    if not executable:
+        raise RuntimeError(f"La commande '{name}' est introuvable dans le PATH.")
+    return executable
+
+
+def run_cli(
+    name: str,
+    arguments: list[str],
+    *,
+    input_text: str | None = None,
+    timeout: int = 45,
+) -> str:
+    executable = executable_path(name)
+    command = [executable, *arguments]
+    if Path(executable).suffix.lower() in {".bat", ".cmd"}:
+        command = [
+            os.environ.get("COMSPEC", "cmd.exe"),
+            "/d",
+            "/s",
+            "/c",
+            subprocess.list2cmdline(command),
+        ]
+    result = subprocess.run(
+        command,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"code {result.returncode}"
+        raise RuntimeError(detail[:800])
+    return result.stdout.strip()
+
+
+def run_cli_json(name: str, arguments: list[str], timeout: int = 45) -> Any:
+    output = run_cli(name, arguments, timeout=timeout)
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"La commande {name} n'a pas retourne de JSON valide.") from exc
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_openclaw_schema() -> tuple[dict[str, Any], str]:
+    try:
+        value = run_cli_json("openclaw", ["config", "schema"], timeout=60)
+        return (value if isinstance(value, dict) else {}), ""
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        return {}, str(exc)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_openclaw_models() -> tuple[list[dict[str, Any]], dict[str, Any], str]:
+    try:
+        listed = run_cli_json("openclaw", ["models", "list", "--json"], timeout=60)
+        status = run_cli_json("openclaw", ["models", "status", "--json"], timeout=60)
+        items = listed if isinstance(listed, list) else listed.get("models", []) if isinstance(listed, dict) else []
+        return [item for item in items if isinstance(item, dict)], status if isinstance(status, dict) else {}, ""
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        return [], {}, str(exc)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_openclaw_plugins() -> tuple[list[dict[str, Any]], str]:
+    try:
+        value = run_cli_json("openclaw", ["plugins", "list", "--json"], timeout=90)
+        items = value if isinstance(value, list) else value.get("plugins", []) if isinstance(value, dict) else []
+        return [item for item in items if isinstance(item, dict)], ""
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        return [], str(exc)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_openclaw_skills() -> tuple[list[dict[str, Any]], str]:
+    try:
+        value = run_cli_json("openclaw", ["skills", "list", "--json"], timeout=90)
+        items = value if isinstance(value, list) else value.get("skills", []) if isinstance(value, dict) else []
+        return [item for item in items if isinstance(item, dict)], ""
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        return [], str(exc)
+
+
+def patch_openclaw_config(patch: dict[str, Any]) -> None:
+    run_cli(
+        "openclaw",
+        ["config", "patch", "--stdin"],
+        input_text=json.dumps(patch, ensure_ascii=True),
+        timeout=60,
+    )
+    run_cli("openclaw", ["config", "validate"], timeout=60)
+    load_openclaw_models.clear()
+    load_openclaw_plugins.clear()
+    load_openclaw_skills.clear()
+
+
+def save_json_config(path: Path, value: dict[str, Any]) -> Path | None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    backup_path: Path | None = None
+    if path.exists():
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup_path = path.with_name(f"{path.name}.bak-{timestamp}")
+        shutil.copy2(path, backup_path)
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    temporary_path.write_text(json.dumps(value, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    os.replace(temporary_path, path)
+    return backup_path
+
+
+def nested_value(value: dict[str, Any], path: str, default: Any = None) -> Any:
+    current: Any = value
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return default
+        current = current[part]
+    return current
+
+
+def set_nested_value(value: dict[str, Any], path: str, new_value: Any) -> None:
+    parts = path.split(".")
+    current = value
+    for part in parts[:-1]:
+        child = current.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            current[part] = child
+        current = child
+    current[parts[-1]] = new_value
+
+
+def delete_nested_value(value: dict[str, Any], path: str) -> None:
+    parts = path.split(".")
+    current: Any = value
+    parents: list[tuple[dict[str, Any], str]] = []
+    for part in parts[:-1]:
+        if not isinstance(current, dict) or not isinstance(current.get(part), dict):
+            return
+        parents.append((current, part))
+        current = current[part]
+    if isinstance(current, dict):
+        current.pop(parts[-1], None)
+    for parent, key in reversed(parents):
+        if isinstance(parent.get(key), dict) and not parent[key]:
+            parent.pop(key, None)
+
+
+def nested_patch(path: str, new_value: Any) -> dict[str, Any]:
+    patch: dict[str, Any] = {}
+    set_nested_value(patch, path, new_value)
+    return patch
+
+
+def deep_merge(target: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    result = copy.deepcopy(target)
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def is_sensitive_config_path(path: str) -> bool:
+    normalized = path.lower().replace("-", "_")
+    parts = normalized.replace("[", ".").replace("]", "").split(".")
+    return any(word in part for part in parts for word in SENSITIVE_CONFIG_WORDS)
+
+
+def schema_pointer(root: dict[str, Any], pointer: str) -> dict[str, Any]:
+    if not pointer.startswith("#/"):
+        return {}
+    current: Any = root
+    for part in pointer[2:].split("/"):
+        key = part.replace("~1", "/").replace("~0", "~")
+        if not isinstance(current, dict) or key not in current:
+            return {}
+        current = current[key]
+    return current if isinstance(current, dict) else {}
+
+
+def resolved_schema_node(root: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
+    resolved = dict(node)
+    reference = resolved.get("$ref")
+    if isinstance(reference, str):
+        base = schema_pointer(root, reference)
+        resolved = {**base, **{key: value for key, value in resolved.items() if key != "$ref"}}
+    return resolved
+
+
+def schema_type_and_choices(root: dict[str, Any], node: dict[str, Any]) -> tuple[str, list[Any]]:
+    node = resolved_schema_node(root, node)
+    choices = list(node.get("enum", [])) if isinstance(node.get("enum"), list) else []
+    value_type = node.get("type") if isinstance(node.get("type"), str) else ""
+    variants = node.get("anyOf") if isinstance(node.get("anyOf"), list) else []
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        variant = resolved_schema_node(root, variant)
+        if "const" in variant and variant["const"] is not None:
+            choices.append(variant["const"])
+        if not value_type and isinstance(variant.get("type"), str) and variant.get("type") != "null":
+            value_type = variant["type"]
+    if choices:
+        value_type = "enum"
+    return value_type or "object", list(dict.fromkeys(choices))
+
+
+def flatten_schema(root: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+
+    def visit(node: dict[str, Any], path: str, seen: set[str]) -> None:
+        reference = node.get("$ref")
+        if isinstance(reference, str):
+            if reference in seen:
+                return
+            seen = {*seen, reference}
+        node = resolved_schema_node(root, node)
+        properties = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        if properties:
+            for name, child in properties.items():
+                if isinstance(child, dict):
+                    visit(child, f"{path}.{name}" if path else name, seen)
+            return
+        if not path or is_sensitive_config_path(path):
+            return
+        value_type, choices = schema_type_and_choices(root, node)
+        rows.append(
+            {
+                "Chemin": path,
+                "Type": value_type,
+                "Valeurs": ", ".join(str(choice) for choice in choices[:20]),
+                "Defaut": node.get("default", ""),
+                "Description": str(node.get("description") or node.get("title") or ""),
+            }
+        )
+
+    visit(root, "", set())
+    return rows
+
+
+def plugin_id(plugin: dict[str, Any]) -> str:
+    return str(plugin.get("id") or plugin.get("name") or plugin.get("pluginId") or "")
+
+
+def plugin_enabled(plugin: dict[str, Any]) -> bool:
+    if isinstance(plugin.get("enabled"), bool):
+        return bool(plugin["enabled"])
+    return str(plugin.get("status") or plugin.get("state") or "").lower() in {"enabled", "loaded", "active"}
+
+
+def scan_qwen_extensions() -> list[dict[str, Any]]:
+    extension_dir = Path.home() / ".qwen" / "extensions"
+    rows: list[dict[str, Any]] = []
+    for manifest in sorted(extension_dir.glob("*/qwen-extension.json")) if extension_dir.exists() else []:
+        value = load_json_object(manifest)
+        rows.append(
+            {
+                "Extension": value.get("name") or manifest.parent.name,
+                "Version": value.get("version", ""),
+                "Chemin": str(manifest.parent),
+            }
+        )
+    return rows
+
+
+def scan_qwen_skills() -> list[dict[str, Any]]:
+    roots = [Path.home() / ".qwen" / "skills", Path.cwd() / ".qwen" / "skills"]
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for root in roots:
+        for skill_path in sorted(root.glob("*/SKILL.md")) if root.exists() else []:
+            resolved = str(skill_path.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            rows.append({"Skill": skill_path.parent.name, "Chemin": str(skill_path)})
+    return rows
+
+
 def resolve_config_value(value: Any) -> str:
     if not isinstance(value, str) or not value or value.startswith("<"):
         return ""
@@ -285,6 +642,88 @@ def harness_process_metrics(processes: list[dict[str, Any]]) -> dict[str, Any]:
         "memory_bytes": sum(int(process.get("memory_bytes") or 0) for process in processes),
         "started_at": min(value for value in start_times if value > 0) if any(start_times) else 0.0,
     }
+
+
+def effective_harness_connection(config: dict[str, Any], override: dict[str, Any] | None) -> dict[str, Any]:
+    connection = dict(config)
+    if override:
+        for key in ("base_url", "api_key", "model"):
+            if key in override:
+                connection[key] = override[key]
+    return connection
+
+
+def start_harness(harness_id: str, config: dict[str, Any]) -> None:
+    if os.name != "nt":
+        raise RuntimeError("Le pilotage des harnesses est actuellement disponible uniquement sous Windows.")
+
+    executable_name = "openclaw" if harness_id == "openclaw" else "qwen"
+    executable = shutil.which(executable_name)
+    if not executable:
+        raise RuntimeError(f"La commande '{executable_name}' est introuvable dans le PATH.")
+
+    base_url = str(config.get("base_url") or "").strip().rstrip("/")
+    api_key = str(config.get("api_key") or "").strip()
+    configured_model = str(config.get("model") or "").strip()
+    model = configured_model.split("/", 1)[-1]
+    if not base_url or not model:
+        raise RuntimeError("Renseigne au minimum l'endpoint vLLM et le modèle dans Options vLLM.")
+
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "VLLM_BASE_URL": base_url,
+            "VLLM_API_KEY": api_key,
+            "VLLM_MODEL": model,
+            "OPENAI_BASE_URL": base_url,
+            "OPENAI_API_KEY": api_key,
+            "OPENAI_MODEL": model,
+            "QWEN_MODEL": model,
+        }
+    )
+    command = (
+        [executable, "gateway", "run", "--force"]
+        if harness_id == "openclaw"
+        else [executable, "--auth-type", "openai"]
+    )
+    if Path(executable).suffix.lower() in {".bat", ".cmd"}:
+        command = [os.environ.get("COMSPEC", "cmd.exe"), "/k", subprocess.list2cmdline(command)]
+
+    subprocess.Popen(
+        command,
+        cwd=str(Path.cwd()),
+        env=environment,
+        creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+    )
+
+
+def stop_harness(processes: list[dict[str, Any]]) -> int:
+    if os.name != "nt":
+        raise RuntimeError("Le pilotage des harnesses est actuellement disponible uniquement sous Windows.")
+    process_ids = sorted({int(process.get("pid") or 0) for process in processes if int(process.get("pid") or 0) > 0})
+    if not process_ids:
+        return 0
+
+    stopped = 0
+    errors: list[str] = []
+    for process_id in process_ids:
+        result = subprocess.run(
+            ["taskkill.exe", "/PID", str(process_id), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode == 0:
+            stopped += 1
+        elif result.stderr.strip():
+            errors.append(result.stderr.strip())
+    if stopped == 0 and errors:
+        raise RuntimeError(errors[0][:300])
+    return stopped
 
 
 def openclaw_harness_config(processes: list[dict[str, Any]]) -> dict[str, Any]:
@@ -670,10 +1109,10 @@ def vllm_health(pod: dict[str, Any], credentials: dict[str, str] | None) -> dict
 def status_badge(status: dict[str, str]) -> str:
     return (
         '<span style="display:inline-flex;align-items:center;gap:0.4rem;'
-        'padding:0.2rem 0.6rem;border-radius:999px;color:white;'
-        f'background:{status["color"]};font-weight:600;font-size:0.85rem;">'
+        'padding:0.38rem 0.7rem;border-radius:999px;color:white;'
+        f'background:{status["color"]};font-weight:650;font-size:0.92rem;">'
         '<span style="width:0.5rem;height:0.5rem;border-radius:50%;background:white;"></span>'
-        f'{status["label"]}</span>'
+        f'{html.escape(status["label"])}</span>'
     )
 
 
@@ -722,21 +1161,35 @@ def inject_dashboard_styles() -> None:
     st.markdown(
         """
         <style>
-        .stApp { background: #0b0f13; }
+        .stApp {
+            background: #0b0f13;
+            font-size: 1.02rem;
+        }
         [data-testid="stSidebar"] {
             background: #10151b;
             border-right: 1px solid #26313d;
         }
         [data-testid="stHeader"] { background: rgba(11, 15, 19, 0.88); }
+        [data-testid="stCaptionContainer"] p {
+            color: #a8b3be;
+            font-size: 0.9rem;
+            line-height: 1.45;
+        }
         [data-testid="stMetric"] {
             background: #141a21;
             border: 1px solid #2a3541;
             border-radius: 6px;
-            padding: 0.85rem 1rem;
-            min-height: 108px;
+            padding: 1rem 1.1rem;
+            min-height: 118px;
         }
-        [data-testid="stMetricLabel"] { color: #9ba8b5; }
-        [data-testid="stMetricValue"] { color: #f3f6f8; }
+        [data-testid="stMetricLabel"] {
+            color: #aab5c0;
+            font-size: 0.9rem;
+        }
+        [data-testid="stMetricValue"] {
+            color: #f3f6f8;
+            font-size: 2rem;
+        }
         [data-testid="stDataFrame"] {
             border: 1px solid #2a3541;
             border-radius: 6px;
@@ -744,11 +1197,29 @@ def inject_dashboard_styles() -> None:
         }
         .stButton > button, .stDownloadButton > button, .stLinkButton > a {
             border-radius: 6px;
-            min-height: 2.45rem;
+            min-height: 2.75rem;
+            font-size: 0.95rem;
+            font-weight: 600;
+        }
+        [data-testid="stTextInput"] input {
+            min-height: 2.75rem;
+            font-size: 0.96rem;
+        }
+        [data-testid="stButtonGroup"] {
+            margin: 0.2rem 0 1.25rem;
+        }
+        [data-testid="stButtonGroup"] button[data-variant="segmented_control"] {
+            min-height: 2.9rem;
+            font-size: 0.94rem;
+            font-weight: 600;
+            padding-inline: 0.85rem;
+        }
+        [data-testid="stButtonGroup"] button[data-variant="segmented_control"] p {
+            font-size: 0.94rem;
         }
         .dashboard-kicker {
             color: #55d6be;
-            font-size: 0.72rem;
+            font-size: 0.78rem;
             font-weight: 700;
             letter-spacing: 0;
             margin-bottom: 0.15rem;
@@ -759,7 +1230,7 @@ def inject_dashboard_styles() -> None:
             margin: 0.4rem 0 1.2rem;
         }
         .harness-logo {
-            height: 92px;
+            height: 112px;
             background: #f3f6f8;
             border-radius: 6px;
             display: flex;
@@ -769,19 +1240,60 @@ def inject_dashboard_styles() -> None:
         }
         .harness-logo img {
             max-width: 100%;
-            max-height: 68px;
+            max-height: 82px;
             object-fit: contain;
         }
-        .harness-stat-label {
-            color: #8f9dab;
-            font-size: 0.76rem;
-            margin-bottom: 0.1rem;
-        }
-        .harness-stat-value {
-            color: #eef2f5;
-            font-size: 1rem;
-            font-weight: 650;
+        .harness-config-path {
+            color: #98a5b2;
+            font-size: 0.9rem;
+            line-height: 1.4;
             overflow-wrap: anywhere;
+        }
+        .harness-stat-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 0;
+            margin: 1rem 0 0.9rem;
+            border-top: 1px solid #26313d;
+            border-bottom: 1px solid #26313d;
+        }
+        .harness-stat {
+            padding: 0.9rem 1rem;
+            border-right: 1px solid #26313d;
+        }
+        .harness-stat:last-child { border-right: 0; }
+        .harness-stat span, .harness-connection span {
+            display: block;
+            color: #98a5b2;
+            font-size: 0.82rem;
+            margin-bottom: 0.25rem;
+        }
+        .harness-stat strong {
+            color: #f1f5f7;
+            font-size: 1.18rem;
+            font-weight: 650;
+        }
+        .harness-connection-grid {
+            display: grid;
+            grid-template-columns: minmax(180px, 0.8fr) minmax(280px, 2fr) minmax(160px, 0.7fr);
+            gap: 1rem;
+            margin-bottom: 0.85rem;
+        }
+        .harness-connection {
+            min-width: 0;
+        }
+        .harness-connection strong {
+            display: block;
+            color: #f1f5f7;
+            font-size: 0.98rem;
+            line-height: 1.45;
+            overflow-wrap: anywhere;
+        }
+        @media (max-width: 900px) {
+            .harness-stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .harness-stat:nth-child(2) { border-right: 0; }
+            .harness-stat:nth-child(-n+2) { border-bottom: 1px solid #26313d; }
+            .harness-connection-grid { grid-template-columns: 1fr; }
         }
         </style>
         """,
@@ -940,7 +1452,7 @@ def render_harness_card(
         overall = {"label": "Opérationnel", "color": "#16a34a"}
 
     with st.container(border=True):
-        logo_col, summary_col = st.columns([1, 4])
+        logo_col, summary_col = st.columns([1, 4.5])
         with logo_col:
             logo_uri = logo_data_uri(logo_filename)
             if logo_uri:
@@ -949,51 +1461,162 @@ def render_harness_card(
                     unsafe_allow_html=True,
                 )
         with summary_col:
-            title_col, status_col = st.columns([3, 1])
+            title_col, status_col = st.columns([3.5, 1])
             with title_col:
                 st.subheader(name)
-                st.caption(
-                    f"Configuration détectée : {config.get('config_path')}"
-                    if config.get("configured")
-                    else f"Configuration absente : {config.get('config_path')}"
+                config_label = "Configuration détectée" if config.get("configured") else "Configuration absente"
+                st.markdown(
+                    f'<div class="harness-config-path">{config_label} : '
+                    f'{html.escape(str(config.get("config_path") or ""))}</div>',
+                    unsafe_allow_html=True,
                 )
             with status_col:
                 st.markdown(status_badge(overall), unsafe_allow_html=True)
 
-        stat_cols = st.columns(5)
+        feedback = st.session_state.setdefault("harness_feedback", {}).pop(harness_id, None)
+        if feedback:
+            if feedback[0] == "success":
+                st.success(feedback[1])
+            else:
+                st.error(feedback[1])
+
+        action_col, options_col, spacer_col = st.columns([1, 1.2, 2.8])
+        with action_col:
+            if st.button(
+                "Arrêter" if running else "Démarrer",
+                icon=":material/stop:" if running else ":material/play_arrow:",
+                key=f"harness_action_{harness_id}",
+                type="primary" if not running else "secondary",
+                width="stretch",
+            ):
+                try:
+                    if running:
+                        stopped = stop_harness(config.get("processes") or [])
+                        message = f"Arrêt demandé pour {name} ({stopped} arbre(s) de processus)."
+                    else:
+                        start_harness(harness_id, config)
+                        message = f"{name} a été lancé dans une nouvelle console Windows."
+                    st.session_state["harness_feedback"][harness_id] = ("success", message)
+                    time.sleep(0.7)
+                except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                    st.session_state["harness_feedback"][harness_id] = ("error", str(exc))
+                st.rerun()
+        with options_col:
+            options_key = f"show_harness_options_{harness_id}"
+            options_open = bool(st.session_state.get(options_key))
+            if st.button(
+                "Masquer" if options_open else "Options vLLM",
+                icon=":material/close:" if options_open else ":material/settings:",
+                key=f"toggle_harness_options_{harness_id}",
+                width="stretch",
+            ):
+                st.session_state[options_key] = not options_open
+                st.rerun()
+        with spacer_col:
+            st.caption("La connexion temporaire est injectée au prochain lancement du harness.")
+
         stats = [
             ("Processus", str(process_metrics.get("count", 0))),
             ("En ligne depuis", duration_text(number_value(process_metrics.get("started_at")))),
             ("Mémoire locale", memory_text(int(process_metrics.get("memory_bytes") or 0))),
-            (
-                "vLLM",
-                str(vllm_probe.get("label") or "Inconnu"),
-            ),
-            (
-                "Latence",
-                f"{vllm_probe['latency_ms']} ms" if vllm_probe.get("latency_ms") is not None else "—",
-            ),
+            ("Latence vLLM", f"{vllm_probe['latency_ms']} ms" if vllm_probe.get("latency_ms") is not None else "—"),
         ]
-        for column, (label, value) in zip(stat_cols, stats):
-            with column:
-                st.caption(label)
-                st.write(f"**{value}**")
+        stat_markup = "".join(
+            '<div class="harness-stat">'
+            f'<span>{html.escape(label)}</span><strong>{html.escape(value)}</strong>'
+            "</div>"
+            for label, value in stats
+        )
+        st.markdown(f'<div class="harness-stat-grid">{stat_markup}</div>', unsafe_allow_html=True)
 
-        connection_cols = st.columns([2, 2, 1])
-        with connection_cols[0]:
-            st.caption("Modèle configuré")
-            st.code(str(config.get("model") or "Non renseigné"), language=None)
-        with connection_cols[1]:
-            st.caption("Endpoint vLLM")
-            st.code(str(config.get("base_url") or "Non renseigné"), language=None)
-        with connection_cols[2]:
-            st.caption("Alignement")
-            if alignment is True:
-                st.success("Modèle aligné")
-            elif alignment is False:
-                st.warning("Modèle différent")
-            else:
-                st.info("Non vérifiable")
+        alignment_label = "Modèle aligné" if alignment is True else "Modèle différent" if alignment is False else "Non vérifiable"
+        connection_markup = (
+            '<div class="harness-connection-grid">'
+            '<div class="harness-connection"><span>Modèle configuré</span>'
+            f'<strong>{html.escape(str(config.get("model") or "Non renseigné"))}</strong></div>'
+            '<div class="harness-connection"><span>Endpoint vLLM</span>'
+            f'<strong>{html.escape(str(config.get("base_url") or "Non renseigné"))}</strong></div>'
+            '<div class="harness-connection"><span>État vLLM</span>'
+            f'<strong>{html.escape(str(vllm_probe.get("label") or "Inconnu"))} · {html.escape(alignment_label)}</strong></div>'
+            "</div>"
+        )
+        st.markdown(connection_markup, unsafe_allow_html=True)
+
+        options_key = f"show_harness_options_{harness_id}"
+        if st.session_state.get(options_key):
+            st.markdown("#### Connexion vLLM temporaire")
+            st.caption("Ces valeurs restent dans la session Streamlit et ne sont pas écrites dans les fichiers locaux.")
+            with st.form(f"harness_connection_form_{harness_id}", border=False):
+                endpoint_value = st.text_input(
+                    "Endpoint OpenAI-compatible",
+                    value=str(config.get("base_url") or ""),
+                    placeholder="https://<pod-id>-8000.proxy.runpod.net/v1",
+                )
+                key_value = st.text_input(
+                    "Clé API vLLM",
+                    type="password",
+                    placeholder="Laisser vide pour conserver la clé locale actuelle",
+                    help="La clé détectée n'est jamais préremplie dans le navigateur. Saisis-en une uniquement pour la remplacer temporairement.",
+                )
+                model_value = st.text_input(
+                    "Modèle",
+                    value=str(config.get("model") or ""),
+                    disabled=harness_id == "openclaw",
+                    help=(
+                        "Le modèle OpenClaw reste défini dans openclaw.json ; l'endpoint et la clé sont injectés à la volée."
+                        if harness_id == "openclaw"
+                        else "Identifiant du modèle exposé par vLLM."
+                    ),
+                )
+                restart_now = st.toggle(
+                    "Redémarrer maintenant avec cette connexion",
+                    value=running,
+                    key=f"restart_harness_{harness_id}",
+                )
+                save_col, reset_col = st.columns(2)
+                with save_col:
+                    save_connection = st.form_submit_button(
+                        "Appliquer", icon=":material/link:", type="primary", width="stretch"
+                    )
+                with reset_col:
+                    reset_connection = st.form_submit_button(
+                        "Réinitialiser", icon=":material/restart_alt:", width="stretch"
+                    )
+
+            if save_connection:
+                endpoint_value = endpoint_value.strip().rstrip("/")
+                model_value = model_value.strip()
+                if not endpoint_value.startswith(("http://", "https://")):
+                    st.error("L'endpoint doit commencer par http:// ou https://.")
+                elif not model_value:
+                    st.error("Le modèle ne peut pas être vide.")
+                else:
+                    override = {
+                        "base_url": endpoint_value,
+                        "api_key": key_value.strip() or str(config.get("api_key") or ""),
+                        "model": model_value,
+                    }
+                    st.session_state.setdefault("harness_runtime_connections", {})[harness_id] = override
+                    try:
+                        if restart_now:
+                            if running:
+                                stop_harness(config.get("processes") or [])
+                                time.sleep(0.7)
+                            start_harness(harness_id, effective_harness_connection(config, override))
+                        message = "Connexion temporaire enregistrée"
+                        if restart_now:
+                            message += " et harness relancé"
+                        st.session_state["harness_feedback"][harness_id] = ("success", message + ".")
+                    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                        st.session_state["harness_feedback"][harness_id] = ("error", str(exc))
+                    st.rerun()
+            elif reset_connection:
+                st.session_state.setdefault("harness_runtime_connections", {}).pop(harness_id, None)
+                st.session_state["harness_feedback"][harness_id] = (
+                    "success",
+                    "Connexion temporaire supprimée. La configuration locale redevient la référence.",
+                )
+                st.rerun()
 
         if harness_id == "openclaw":
             gateway_port = int(config.get("gateway_port") or 18789)
@@ -1046,6 +1669,8 @@ def render_live_harnesses() -> None:
     probe_cache: dict[tuple[str, str], dict[str, Any]] = {}
     runtime_rows: list[tuple[str, str, str, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
     for harness_id, name, logo, config in harnesses:
+        override = st.session_state.get("harness_runtime_connections", {}).get(harness_id)
+        config = effective_harness_connection(config, override)
         process_metrics = harness_process_metrics(config.get("processes") or [])
         probe_key = (str(config.get("base_url") or ""), str(config.get("api_key") or ""))
         if probe_key not in probe_cache:
@@ -1387,12 +2012,799 @@ def render_templates() -> None:
         st.info("Aucun template disponible.")
 
 
+def typed_setting_widget(spec: dict[str, Any], current: Any, key: str) -> Any:
+    value_type = str(spec.get("type") or "string")
+    choices = list(spec.get("choices") or [])
+    label = str(spec.get("path") or spec.get("Chemin") or "Valeur")
+    description = str(spec.get("description") or spec.get("Description") or "")
+    if value_type == "boolean":
+        return st.toggle(label, value=bool(current) if isinstance(current, bool) else False, help=description, key=key)
+    if value_type == "enum" and choices:
+        options = list(choices)
+        if current not in options and current is not None:
+            options.insert(0, current)
+        index = options.index(current) if current in options else 0
+        return st.selectbox(label, options, index=index, help=description, key=key)
+    if value_type == "integer":
+        return int(
+            st.number_input(
+                label,
+                value=int(current) if isinstance(current, (int, float)) and not isinstance(current, bool) else 0,
+                step=1,
+                help=description,
+                key=key,
+            )
+        )
+    if value_type == "number":
+        return float(
+            st.number_input(
+                label,
+                value=float(current) if isinstance(current, (int, float)) and not isinstance(current, bool) else 0.0,
+                step=0.05,
+                format="%.3f",
+                help=description,
+                key=key,
+            )
+        )
+    if value_type in {"array", "object"}:
+        initial = current if isinstance(current, (list, dict)) else ([] if value_type == "array" else {})
+        return st.text_area(
+            label,
+            value=json.dumps(initial, indent=2, ensure_ascii=True),
+            height=180,
+            help=description,
+            key=key,
+        )
+    return st.text_input(label, value="" if current is None else str(current), help=description, key=key)
+
+
+def parsed_setting_value(raw_value: Any, value_type: str) -> Any:
+    if value_type not in {"array", "object"}:
+        return raw_value
+    value = json.loads(str(raw_value))
+    expected = list if value_type == "array" else dict
+    if not isinstance(value, expected):
+        raise ValueError(f"La valeur doit etre de type {value_type}.")
+    return value
+
+
+def render_advanced_editor(
+    title: str,
+    rows: list[dict[str, Any]],
+    current_config: dict[str, Any],
+    save_value: Any,
+    delete_value: Any,
+    key_prefix: str,
+) -> None:
+    st.subheader(title)
+    search = st.text_input(
+        "Rechercher un réglage",
+        placeholder="model, thinking, plugin, tools...",
+        key=f"{key_prefix}_search",
+    ).strip().lower()
+    normalized_rows: list[dict[str, Any]] = []
+    for row in rows:
+        path = str(row.get("Chemin") or row.get("path") or "")
+        if not path or "*" in path or is_sensitive_config_path(path):
+            continue
+        normalized = {
+            "Chemin": path,
+            "Type": str(row.get("Type") or row.get("type") or "string"),
+            "Valeurs": str(row.get("Valeurs") or ", ".join(str(value) for value in row.get("choices", []))),
+            "Defaut": row.get("Defaut", ""),
+            "Description": str(row.get("Description") or row.get("description") or ""),
+        }
+        haystack = " ".join(str(value).lower() for value in normalized.values())
+        if not search or search in haystack:
+            normalized_rows.append(normalized)
+
+    st.caption(f"{len(normalized_rows)} réglage(s) affiché(s). Les chemins sensibles sont masqués.")
+    if normalized_rows:
+        st.dataframe(normalized_rows[:500], width="stretch", hide_index=True, height=280)
+    else:
+        st.info("Aucun réglage ne correspond à cette recherche.")
+        return
+
+    selectable = normalized_rows[:500]
+    selected_path = st.selectbox(
+        "Réglage à modifier",
+        [row["Chemin"] for row in selectable],
+        key=f"{key_prefix}_path",
+    )
+    selected = next(row for row in selectable if row["Chemin"] == selected_path)
+    choices = [value.strip() for value in selected["Valeurs"].split(",") if value.strip()]
+    spec = {
+        "path": selected_path,
+        "type": selected["Type"],
+        "choices": choices,
+        "description": selected["Description"],
+    }
+    current = nested_value(current_config, selected_path)
+    with st.form(f"{key_prefix}_editor_form", border=False):
+        edited = typed_setting_widget(spec, current, f"{key_prefix}_value_{selected_path}")
+        save_col, inherit_col = st.columns(2)
+        with save_col:
+            save_clicked = st.form_submit_button(
+                "Enregistrer", icon=":material/save:", type="primary", width="stretch"
+            )
+        with inherit_col:
+            delete_clicked = st.form_submit_button(
+                "Retirer la surcharge", icon=":material/undo:", width="stretch"
+            )
+    try:
+        if save_clicked:
+            save_value(selected_path, parsed_setting_value(edited, selected["Type"]))
+            st.success(f"{selected_path} enregistré.")
+            st.rerun()
+        if delete_clicked:
+            delete_value(selected_path)
+            st.success(f"{selected_path} revient à sa valeur héritée.")
+            st.rerun()
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
+        st.error(f"Modification impossible : {exc}")
+
+
+def render_openclaw_model_settings(
+    config: dict[str, Any],
+    models: list[dict[str, Any]],
+    model_status: dict[str, Any],
+) -> None:
+    defaults = nested_value(config, "agents.defaults", {})
+    current_model = str(nested_value(config, "agents.defaults.model.primary", ""))
+    model_keys = [str(item.get("key") or item.get("id") or "") for item in models]
+    model_keys = [key for key in dict.fromkeys([current_model, *model_keys]) if key]
+    selected_row = next((item for item in models if str(item.get("key") or item.get("id")) == current_model), {})
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Modèle actif", current_model or "Non défini")
+    metric_cols[1].metric("Contexte", f"{int(number_value(selected_row.get('contextWindow') or selected_row.get('contextTokens'))):,}" if selected_row else "Inconnu")
+    metric_cols[2].metric("Disponible", "Oui" if selected_row.get("available") else "Non vérifié")
+    metric_cols[3].metric("Fallbacks", len(model_status.get("fallbacks") or []))
+
+    current_model_params = nested_value(defaults, f"models.{current_model}.params", {})
+    if not isinstance(current_model_params, dict):
+        current_model_params = {}
+    global_params = defaults.get("params", {}) if isinstance(defaults, dict) else {}
+    max_tokens = int(number_value(current_model_params.get("maxTokens") or global_params.get("maxTokens") or 2048))
+    current_thinking = str(defaults.get("thinkingDefault") or "inherit") if isinstance(defaults, dict) else "inherit"
+    fast_supported = current_model.startswith(("openai/", "anthropic/"))
+
+    st.subheader("Modèle et génération")
+    with st.form("openclaw_model_form", border=False):
+        selected_model = st.selectbox(
+            "Modèle principal",
+            model_keys or [current_model or "vllm/model"],
+            index=model_keys.index(current_model) if current_model in model_keys else 0,
+        )
+        thinking = st.selectbox(
+            "Mode thinking",
+            ["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max", "ultra", "on"],
+            index=["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max", "ultra", "on"].index(current_thinking)
+            if current_thinking in ["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max", "ultra", "on"]
+            else 0,
+            help="Avec les modèles Qwen servis par vLLM, le comportement réellement supporté est généralement binaire : off ou on.",
+        )
+        max_tokens_value = st.number_input(
+            "Tokens générés maximum",
+            min_value=128,
+            max_value=1_000_000,
+            value=max(128, max_tokens),
+            step=128,
+        )
+        temperature_override = st.toggle(
+            "Surcharger la température",
+            value=isinstance(current_model_params.get("temperature"), (int, float)),
+        )
+        temperature = st.slider(
+            "Température",
+            min_value=0.0,
+            max_value=2.0,
+            value=float(current_model_params.get("temperature", 0.7)),
+            step=0.05,
+            disabled=not temperature_override,
+        )
+        if fast_supported:
+            fast_mode = st.selectbox(
+                "Fast mode",
+                ["inherit", "off", "on", "auto"],
+                index=["inherit", "off", "on", "auto"].index(str(current_model_params.get("fastMode") or "inherit"))
+                if str(current_model_params.get("fastMode") or "inherit") in ["inherit", "off", "on", "auto"]
+                else 0,
+            )
+            fast_auto_seconds = st.number_input(
+                "Activation automatique après (secondes)",
+                min_value=1,
+                value=max(1, int(number_value(current_model_params.get("fastAutoOnSeconds") or 30))),
+                disabled=fast_mode != "auto",
+            )
+        else:
+            st.info("Fast mode n'est pas exposé pour ce modèle vLLM. Il dépend du fournisseur et du modèle OpenClaw sélectionné.")
+            fast_mode = "inherit"
+            fast_auto_seconds = 30
+        save_model = st.form_submit_button(
+            "Enregistrer le modèle", icon=":material/save:", type="primary"
+        )
+
+    if save_model:
+        params_patch: dict[str, Any] = {
+            "maxTokens": int(max_tokens_value),
+            "temperature": float(temperature) if temperature_override else None,
+            "fastMode": None if fast_mode == "inherit" else fast_mode,
+            "fastAutoOnSeconds": int(fast_auto_seconds) if fast_mode == "auto" else None,
+        }
+        patch = {
+            "agents": {
+                "defaults": {
+                    "model": {"primary": selected_model},
+                    "thinkingDefault": None if thinking == "inherit" else thinking,
+                    "models": {selected_model: {"params": params_patch}},
+                }
+            }
+        }
+        try:
+            patch_openclaw_config(patch)
+            st.success("Configuration du modèle validée par OpenClaw.")
+            st.rerun()
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            st.error(f"Enregistrement impossible : {exc}")
+
+
+def render_openclaw_runtime_settings(config: dict[str, Any]) -> None:
+    defaults = nested_value(config, "agents.defaults", {})
+    tools = config.get("tools", {}) if isinstance(config.get("tools"), dict) else {}
+    compaction = defaults.get("compaction", {}) if isinstance(defaults, dict) and isinstance(defaults.get("compaction"), dict) else {}
+    st.subheader("Exécution et contexte")
+    with st.form("openclaw_runtime_form", border=False):
+        first_col, second_col = st.columns(2)
+        with first_col:
+            tools_profile = st.selectbox(
+                "Profil d'outils",
+                ["minimal", "coding", "messaging", "full"],
+                index=["minimal", "coding", "messaging", "full"].index(str(tools.get("profile") or "minimal"))
+                if str(tools.get("profile") or "minimal") in ["minimal", "coding", "messaging", "full"]
+                else 0,
+            )
+            max_concurrent = st.number_input(
+                "Agents simultanés maximum",
+                min_value=1,
+                max_value=128,
+                value=max(1, int(number_value(defaults.get("maxConcurrent") or 1))),
+            )
+            elevated = st.selectbox(
+                "Mode elevated par défaut",
+                ["off", "on", "ask", "full"],
+                index=["off", "on", "ask", "full"].index(str(defaults.get("elevatedDefault") or "off"))
+                if str(defaults.get("elevatedDefault") or "off") in ["off", "on", "ask", "full"]
+                else 0,
+            )
+            context_injection = st.selectbox(
+                "Injection du contexte",
+                ["always", "continuation-skip", "never"],
+                index=["always", "continuation-skip", "never"].index(str(defaults.get("contextInjection") or "always"))
+                if str(defaults.get("contextInjection") or "always") in ["always", "continuation-skip", "never"]
+                else 0,
+            )
+        with second_col:
+            bootstrap_max = st.number_input(
+                "Caractères maximum par fichier bootstrap",
+                min_value=0,
+                value=max(0, int(number_value(defaults.get("bootstrapMaxChars") or 20_000))),
+                step=1000,
+            )
+            bootstrap_total = st.number_input(
+                "Caractères bootstrap maximum au total",
+                min_value=0,
+                value=max(0, int(number_value(defaults.get("bootstrapTotalMaxChars") or 60_000))),
+                step=1000,
+            )
+            reserve_tokens = st.number_input(
+                "Tokens réservés avant compaction",
+                min_value=0,
+                value=max(0, int(number_value(compaction.get("reserveTokens") or 2048))),
+                step=256,
+            )
+            keep_recent = st.number_input(
+                "Tokens récents à conserver",
+                min_value=0,
+                value=max(0, int(number_value(compaction.get("keepRecentTokens") or 0))),
+                step=256,
+            )
+            truncate_after = st.toggle(
+                "Tronquer après compaction",
+                value=bool(compaction.get("truncateAfterCompaction", False)),
+            )
+        save_runtime = st.form_submit_button(
+            "Enregistrer le harness", icon=":material/save:", type="primary"
+        )
+    if save_runtime:
+        patch = {
+            "tools": {"profile": tools_profile},
+            "agents": {
+                "defaults": {
+                    "maxConcurrent": int(max_concurrent),
+                    "elevatedDefault": elevated,
+                    "contextInjection": context_injection,
+                    "bootstrapMaxChars": int(bootstrap_max),
+                    "bootstrapTotalMaxChars": int(bootstrap_total),
+                    "compaction": {
+                        "reserveTokens": int(reserve_tokens),
+                        "keepRecentTokens": int(keep_recent),
+                        "truncateAfterCompaction": bool(truncate_after),
+                    },
+                }
+            },
+        }
+        try:
+            patch_openclaw_config(patch)
+            st.success("Configuration d'exécution validée par OpenClaw.")
+            st.rerun()
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            st.error(f"Enregistrement impossible : {exc}")
+
+
+def render_openclaw_extensions(
+    config: dict[str, Any],
+    plugins: list[dict[str, Any]],
+    plugin_error: str,
+    skills: list[dict[str, Any]],
+    skill_error: str,
+) -> None:
+    st.subheader("Plugins")
+    if plugin_error:
+        st.warning(f"Inventaire des plugins indisponible : {plugin_error}")
+    elif plugins:
+        plugin_rows = [
+            {
+                "Plugin": plugin_id(plugin),
+                "Actif": plugin_enabled(plugin),
+                "État": plugin.get("status") or plugin.get("state") or "",
+                "Source": plugin.get("source") or plugin.get("origin") or "",
+            }
+            for plugin in plugins
+            if plugin_id(plugin)
+        ]
+        st.dataframe(plugin_rows, width="stretch", hide_index=True, height=260)
+        selected_plugin = st.selectbox("Plugin à administrer", [row["Plugin"] for row in plugin_rows])
+        selected_plugin_data = next(plugin for plugin in plugins if plugin_id(plugin) == selected_plugin)
+        desired_plugin_state = st.toggle(
+            "Plugin activé",
+            value=plugin_enabled(selected_plugin_data),
+            key=f"plugin_enabled_{selected_plugin}",
+        )
+        if st.button("Appliquer au plugin", icon=":material/power_settings_new:"):
+            try:
+                command = "enable" if desired_plugin_state else "disable"
+                run_cli("openclaw", ["plugins", command, selected_plugin], timeout=60)
+                load_openclaw_plugins.clear()
+                st.success(f"Plugin {selected_plugin} {'activé' if desired_plugin_state else 'désactivé'}.")
+                st.rerun()
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                st.error(f"Modification impossible : {exc}")
+    else:
+        st.info("Aucun plugin OpenClaw détecté.")
+
+    st.divider()
+    st.subheader("Skills visibles par le modèle")
+    if skill_error:
+        st.warning(f"Inventaire des skills indisponible : {skill_error}")
+    else:
+        if skills:
+            st.dataframe(
+                [
+                    {
+                        "Skill": skill.get("name") or skill.get("id") or "",
+                        "Éligible": bool(skill.get("eligible")),
+                        "Visible du modèle": bool(skill.get("modelVisible")),
+                        "Désactivé": bool(skill.get("disabled")),
+                        "Source": skill.get("source") or "",
+                    }
+                    for skill in skills
+                ],
+                width="stretch",
+                hide_index=True,
+                height=260,
+            )
+        eligible_skill_names = [
+            str(skill.get("name") or skill.get("id") or "")
+            for skill in skills
+            if skill.get("eligible")
+        ]
+        eligible_skill_names = [name for name in dict.fromkeys(eligible_skill_names) if name]
+        configured_skills = nested_value(config, "agents.defaults.skills", [])
+        configured_skills = configured_skills if isinstance(configured_skills, list) else []
+        skill_options = list(dict.fromkeys([*eligible_skill_names, *configured_skills]))
+        selected_skills = st.multiselect(
+            "Skills autorisés",
+            skill_options,
+            default=[name for name in configured_skills if name in skill_options],
+            help="Seuls les skills éligibles et ceux déjà configurés sont proposés. Le tableau conserve l'inventaire complet.",
+        )
+        prompt_limit = st.number_input(
+            "Budget maximal des descriptions de skills",
+            min_value=0,
+            value=max(0, int(number_value(nested_value(config, "skills.limits.maxSkillsPromptChars", 0)))),
+            step=1000,
+        )
+        if st.button("Enregistrer les skills", icon=":material/save:"):
+            try:
+                patch_openclaw_config(
+                    {
+                        "agents": {"defaults": {"skills": selected_skills}},
+                        "skills": {"limits": {"maxSkillsPromptChars": int(prompt_limit)}},
+                    }
+                )
+                st.success("Visibilité des skills enregistrée.")
+                st.rerun()
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                st.error(f"Modification impossible : {exc}")
+
+    st.divider()
+    st.subheader("Serveurs MCP")
+    servers = nested_value(config, "mcp.servers", {})
+    servers = servers if isinstance(servers, dict) else {}
+    if servers:
+        st.dataframe(
+            [
+                {
+                    "Serveur": server_id,
+                    "Type": "HTTP" if isinstance(server, dict) and server.get("url") else "stdio",
+                    "Actif": bool(server.get("enabled", True)) if isinstance(server, dict) else False,
+                    "Cible": server.get("url") or server.get("command") or "" if isinstance(server, dict) else "",
+                }
+                for server_id, server in servers.items()
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.caption("Aucun serveur MCP géré par OpenClaw.")
+    with st.form("openclaw_mcp_form", border=False):
+        server_id = st.text_input("Identifiant du serveur MCP", placeholder="ida, filesystem, github...")
+        transport = st.segmented_control("Transport", ["stdio", "HTTP"], default="stdio") or "stdio"
+        enabled = st.toggle("Serveur activé", value=True)
+        if transport == "stdio":
+            command = st.text_input("Commande", placeholder="npx")
+            arguments = st.text_input("Arguments", placeholder="-y package-name")
+            url = ""
+        else:
+            url = st.text_input("URL", placeholder="http://127.0.0.1:3000/mcp")
+            command = ""
+            arguments = ""
+        save_mcp = st.form_submit_button("Ajouter ou mettre à jour", type="primary")
+    if save_mcp:
+        if not server_id.strip() or (transport == "stdio" and not command.strip()) or (transport == "HTTP" and not url.strip()):
+            st.error("L'identifiant et la cible du serveur sont obligatoires.")
+        else:
+            server_value = (
+                {"command": command.strip(), "args": arguments.split(), "enabled": enabled}
+                if transport == "stdio"
+                else {"url": url.strip(), "enabled": enabled}
+            )
+            try:
+                patch_openclaw_config({"mcp": {"servers": {server_id.strip(): server_value}}})
+                st.success(f"Serveur MCP {server_id.strip()} enregistré.")
+                st.rerun()
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                st.error(f"Modification impossible : {exc}")
+    if servers:
+        remove_server = st.selectbox("Serveur à retirer", list(servers), key="mcp_remove_server")
+        if st.button("Retirer le serveur", icon=":material/delete:"):
+            try:
+                patch_openclaw_config({"mcp": {"servers": {remove_server: None}}})
+                st.success(f"Serveur MCP {remove_server} retiré.")
+                st.rerun()
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                st.error(f"Suppression impossible : {exc}")
+
+
+def render_qwen_settings(config: dict[str, Any]) -> None:
+    installed = bool(shutil.which("qwen"))
+    status_cols = st.columns(3)
+    status_cols[0].metric("CLI", "Installée" if installed else "Absente")
+    status_cols[1].metric("Configuration", "Présente" if QWEN_CONFIG_PATH.exists() else "À créer")
+    status_cols[2].metric("Extensions", len(scan_qwen_extensions()))
+    if not installed:
+        st.info("Qwen Code n'est pas dans le PATH. Les réglages peuvent être préparés maintenant et seront lus après son installation.")
+
+    st.subheader("Modèles Qwen Code")
+    with st.form("qwen_model_form", border=False):
+        model_name = st.text_input("Modèle principal", value=str(nested_value(config, "model.name", "")))
+        reasoning_options = ["inherit", "low", "medium", "high", "xhigh", "max"]
+        current_reasoning = str(nested_value(config, "model.reasoningEffort", "inherit"))
+        reasoning = st.selectbox(
+            "Effort de raisonnement",
+            reasoning_options,
+            index=reasoning_options.index(current_reasoning) if current_reasoning in reasoning_options else 0,
+        )
+        thinking = st.toggle(
+            "Thinking Qwen",
+            value=bool(nested_value(config, "model.generationConfig.extra_body.enable_thinking", False)),
+            help="Transmet enable_thinking au serveur compatible OpenAI/vLLM.",
+        )
+        fast_model = st.text_input(
+            "Fast model auxiliaire",
+            value=str(nested_value(config, "model.fastModel", "")),
+            help="Modèle léger pour les suggestions et opérations spéculatives ; ce n'est pas un mode turbo du modèle principal.",
+        )
+        sampling_col, limits_col = st.columns(2)
+        with sampling_col:
+            temperature = st.slider(
+                "Température",
+                0.0,
+                2.0,
+                float(nested_value(config, "model.generationConfig.samplingParams.temperature", 0.7)),
+                0.05,
+            )
+            top_p = st.slider(
+                "Top p",
+                0.0,
+                1.0,
+                float(nested_value(config, "model.generationConfig.samplingParams.top_p", 0.95)),
+                0.05,
+            )
+        with limits_col:
+            max_tokens = st.number_input(
+                "Tokens générés maximum",
+                min_value=128,
+                value=max(128, int(number_value(nested_value(config, "model.generationConfig.samplingParams.max_tokens", 2048)))),
+                step=128,
+            )
+            context_size = st.number_input(
+                "Fenêtre de contexte",
+                min_value=1024,
+                value=max(1024, int(number_value(nested_value(config, "model.generationConfig.contextWindowSize", 131072)))),
+                step=1024,
+            )
+        save_qwen_model = st.form_submit_button("Enregistrer les modèles", type="primary")
+    if save_qwen_model:
+        updated = copy.deepcopy(config)
+        changes = {
+            "model.name": model_name.strip(),
+            "model.generationConfig.extra_body.enable_thinking": thinking,
+            "model.fastModel": fast_model.strip(),
+            "model.generationConfig.samplingParams.temperature": temperature,
+            "model.generationConfig.samplingParams.top_p": top_p,
+            "model.generationConfig.samplingParams.max_tokens": int(max_tokens),
+            "model.generationConfig.contextWindowSize": int(context_size),
+        }
+        for path, value in changes.items():
+            set_nested_value(updated, path, value)
+        if reasoning == "inherit":
+            delete_nested_value(updated, "model.reasoningEffort")
+        else:
+            set_nested_value(updated, "model.reasoningEffort", reasoning)
+        try:
+            backup = save_json_config(QWEN_CONFIG_PATH, updated)
+            st.success("Configuration modèle Qwen Code enregistrée." + (f" Sauvegarde : {backup.name}." if backup else ""))
+            st.rerun()
+        except OSError as exc:
+            st.error(f"Enregistrement impossible : {exc}")
+
+    st.divider()
+    st.subheader("Exécution Qwen Code")
+    with st.form("qwen_runtime_form", border=False):
+        approval_modes = ["plan", "default", "auto-edit", "auto", "yolo"]
+        current_approval = str(nested_value(config, "tools.approvalMode", "default"))
+        approval_mode = st.selectbox(
+            "Mode d'approbation",
+            approval_modes,
+            index=approval_modes.index(current_approval) if current_approval in approval_modes else 1,
+        )
+        limit_cols = st.columns(3)
+        with limit_cols[0]:
+            max_turns = st.number_input("Tours maximum", min_value=0, value=max(0, int(number_value(nested_value(config, "model.maxSessionTurns", 0)))))
+            max_seconds = st.number_input("Durée maximum (s)", min_value=0, value=max(0, int(number_value(nested_value(config, "model.maxWallTimeSeconds", 0)))))
+        with limit_cols[1]:
+            max_tools = st.number_input("Appels d'outils maximum", min_value=0, value=max(0, int(number_value(nested_value(config, "model.maxToolCalls", 0)))))
+            max_tools_turn = st.number_input("Outils maximum par tour", min_value=0, value=max(0, int(number_value(nested_value(config, "model.maxToolCallsPerTurn", 0)))))
+        with limit_cols[2]:
+            max_depth = st.number_input("Profondeur des sous-agents", min_value=0, value=max(0, int(number_value(nested_value(config, "model.maxSubagentDepth", 0)))))
+            compact_threshold = st.number_input("Seuil de compaction", min_value=0.0, max_value=1.0, value=float(nested_value(config, "context.autoCompactThreshold", 0.8)), step=0.05)
+        toggle_cols = st.columns(3)
+        with toggle_cols[0]:
+            use_rg = st.toggle("Utiliser ripgrep", value=bool(nested_value(config, "tools.useRipgrep", True)))
+            tool_search = st.toggle("Recherche d'outils", value=bool(nested_value(config, "tools.toolSearch.enabled", True)))
+        with toggle_cols[1]:
+            folder_trust = st.toggle("Confiance des dossiers", value=bool(nested_value(config, "security.folderTrust.enabled", True)))
+            loop_detection = st.toggle("Détection de boucle", value=not bool(nested_value(config, "model.skipLoopDetection", False)))
+        with toggle_cols[2]:
+            telemetry = st.toggle("Télémétrie", value=bool(nested_value(config, "telemetry.enabled", False)))
+            tokens_per_second = st.toggle("Afficher tokens/s", value=bool(nested_value(config, "ui.showTokensPerSecond", True)))
+        save_qwen_runtime = st.form_submit_button("Enregistrer le harness", type="primary")
+    if save_qwen_runtime:
+        updated = copy.deepcopy(config)
+        changes = {
+            "tools.approvalMode": approval_mode,
+            "model.maxSessionTurns": int(max_turns),
+            "model.maxWallTimeSeconds": int(max_seconds),
+            "model.maxToolCalls": int(max_tools),
+            "model.maxToolCallsPerTurn": int(max_tools_turn),
+            "model.maxSubagentDepth": int(max_depth),
+            "context.autoCompactThreshold": float(compact_threshold),
+            "tools.useRipgrep": use_rg,
+            "tools.toolSearch.enabled": tool_search,
+            "security.folderTrust.enabled": folder_trust,
+            "model.skipLoopDetection": not loop_detection,
+            "telemetry.enabled": telemetry,
+            "ui.showTokensPerSecond": tokens_per_second,
+        }
+        for path, value in changes.items():
+            set_nested_value(updated, path, value)
+        try:
+            backup = save_json_config(QWEN_CONFIG_PATH, updated)
+            st.success("Configuration du harness Qwen Code enregistrée." + (f" Sauvegarde : {backup.name}." if backup else ""))
+            st.rerun()
+        except OSError as exc:
+            st.error(f"Enregistrement impossible : {exc}")
+
+    st.divider()
+    st.subheader("Extensions, skills et MCP")
+    extensions = scan_qwen_extensions()
+    qwen_skills = scan_qwen_skills()
+    inventory_cols = st.columns(3)
+    inventory_cols[0].metric("Extensions", len(extensions))
+    inventory_cols[1].metric("Skills locaux", len(qwen_skills))
+    mcp_servers = config.get("mcpServers", {}) if isinstance(config.get("mcpServers"), dict) else {}
+    inventory_cols[2].metric("Serveurs MCP", len(mcp_servers))
+    if extensions:
+        st.dataframe(extensions, width="stretch", hide_index=True)
+    if qwen_skills:
+        st.dataframe(qwen_skills, width="stretch", hide_index=True)
+    if mcp_servers:
+        st.dataframe(
+            [{"Serveur": name, "Type": "HTTP" if isinstance(value, dict) and value.get("url") else "stdio"} for name, value in mcp_servers.items()],
+            width="stretch",
+            hide_index=True,
+        )
+
+
+def render_configuration(base_url: str, env_api_key: str) -> None:
+    st.subheader("Configuration des modèles et harnesses")
+    st.caption("Inventaire local, paramètres de génération, outils, extensions et schémas configurables.")
+    refresh_col, security_col = st.columns([1, 4])
+    with refresh_col:
+        if st.button("Actualiser", icon=":material/refresh:", key="refresh_configuration"):
+            load_openclaw_schema.clear()
+            load_openclaw_models.clear()
+            load_openclaw_plugins.clear()
+            load_openclaw_skills.clear()
+            st.rerun()
+    with security_col:
+        st.caption("Les clés, tokens, mots de passe et credentials sont exclus des tableaux de configuration.")
+
+    requested_openclaw_section = st.session_state.get("openclaw_configuration_section", "Modèle")
+    load_extensions = requested_openclaw_section == "Plugins, skills et MCP"
+    with st.spinner("Lecture du schéma et des modèles OpenClaw..."):
+        schema, schema_error = load_openclaw_schema()
+        models, model_status, model_error = load_openclaw_models()
+    if load_extensions:
+        with st.spinner("Lecture des plugins et skills OpenClaw..."):
+            plugins, plugin_error = load_openclaw_plugins()
+            skills, skill_error = load_openclaw_skills()
+    else:
+        plugins, plugin_error = [], ""
+        skills, skill_error = [], ""
+    openclaw_config = load_json_object(OPENCLAW_CONFIG_PATH)
+    qwen_config = load_json_object(QWEN_CONFIG_PATH)
+    schema_rows = flatten_schema(schema) if schema else []
+    configured_plugins = nested_value(openclaw_config, "plugins.entries", {})
+    configured_plugins = configured_plugins if isinstance(configured_plugins, dict) else {}
+    configured_skills = nested_value(openclaw_config, "agents.defaults.skills", [])
+    configured_skills = configured_skills if isinstance(configured_skills, list) else []
+
+    top_metrics = st.columns(5)
+    top_metrics[0].metric("Options OpenClaw", len(schema_rows) if schema_rows else "Indisponible")
+    top_metrics[1].metric("Modèles", len(models))
+    top_metrics[2].metric(
+        "Plugins actifs",
+        sum(1 for plugin in plugins if plugin_enabled(plugin))
+        if load_extensions
+        else sum(1 for value in configured_plugins.values() if isinstance(value, dict) and value.get("enabled")),
+    )
+    top_metrics[3].metric("Skills visibles", len(configured_skills))
+    top_metrics[4].metric("Options Qwen", len(QWEN_SETTING_SPECS))
+
+    openclaw_tab, qwen_tab, local_tab = st.tabs(["OpenClaw", "Qwen Code", "Local / RunPod"])
+    with openclaw_tab:
+        if not shutil.which("openclaw"):
+            st.error("OpenClaw n'est pas disponible dans le PATH.")
+        elif not openclaw_config:
+            st.warning(f"Configuration OpenClaw absente ou invalide : {OPENCLAW_CONFIG_PATH}")
+        if model_error:
+            st.warning(f"Inventaire des modèles indisponible : {model_error}")
+        openclaw_section = st.segmented_control(
+            "Section OpenClaw",
+            ["Modèle", "Harness", "Plugins, skills et MCP", "Tous les réglages"],
+            default="Modèle",
+            selection_mode="single",
+            key="openclaw_configuration_section",
+            width="stretch",
+            label_visibility="collapsed",
+        ) or "Modèle"
+        if openclaw_section == "Modèle":
+            render_openclaw_model_settings(openclaw_config, models, model_status)
+        elif openclaw_section == "Harness":
+            render_openclaw_runtime_settings(openclaw_config)
+        elif openclaw_section == "Plugins, skills et MCP":
+            render_openclaw_extensions(openclaw_config, plugins, plugin_error, skills, skill_error)
+        else:
+            if schema_error:
+                st.error(f"Schéma OpenClaw indisponible : {schema_error}")
+            elif schema_rows:
+                render_advanced_editor(
+                    "Schéma OpenClaw complet",
+                    schema_rows,
+                    openclaw_config,
+                    lambda path, value: patch_openclaw_config(nested_patch(path, value)),
+                    lambda path: patch_openclaw_config(nested_patch(path, None)),
+                    "openclaw_advanced",
+                )
+            else:
+                st.info("Aucune option de schéma chargée.")
+
+    with qwen_tab:
+        qwen_section = st.segmented_control(
+            "Section Qwen Code",
+            ["Réglages principaux", "Tous les réglages"],
+            default="Réglages principaux",
+            selection_mode="single",
+            key="qwen_configuration_section",
+            width="stretch",
+            label_visibility="collapsed",
+        ) or "Réglages principaux"
+        if qwen_section == "Réglages principaux":
+            render_qwen_settings(qwen_config)
+        else:
+            qwen_rows = [
+                {
+                    "Chemin": spec["path"],
+                    "Type": spec["type"],
+                    "Valeurs": ", ".join(spec.get("choices", [])),
+                    "Description": spec.get("description", ""),
+                }
+                for spec in QWEN_SETTING_SPECS
+            ]
+
+            def save_qwen_value(path: str, value: Any) -> None:
+                updated = load_json_object(QWEN_CONFIG_PATH)
+                set_nested_value(updated, path, value)
+                save_json_config(QWEN_CONFIG_PATH, updated)
+
+            def delete_qwen_value(path: str) -> None:
+                updated = load_json_object(QWEN_CONFIG_PATH)
+                delete_nested_value(updated, path)
+                save_json_config(QWEN_CONFIG_PATH, updated)
+
+            render_advanced_editor(
+                "Catalogue Qwen Code",
+                qwen_rows,
+                qwen_config,
+                save_qwen_value,
+                delete_qwen_value,
+                "qwen_advanced",
+            )
+
+    with local_tab:
+        st.subheader("Configuration locale et RunPod")
+        st.write(f"**API utilisée :** `{base_url}`")
+        st.write(
+            "**Clé API :** "
+            + ("préremplie depuis RUNPOD_API_KEY" if env_api_key else "saisie pour cette session")
+        )
+        st.warning(
+            "Le dashboard ne place aucune clé dans le repository. Les credentials vLLM temporaires restent dans la session Streamlit."
+        )
+        st.code(
+            '$env:RUNPOD_API_KEY = "<ta-cle-runpod>"\nstreamlit run monitoring/runpod/dashboard/app.py',
+            language="powershell",
+        )
+
+
 def main() -> None:
     st.set_page_config(
         page_title="RunPod Control Center",
         page_icon="R",
         layout="wide",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="auto",
     )
     inject_dashboard_styles()
     st.markdown('<div class="dashboard-kicker">LOCAL GPU CONTROL</div>', unsafe_allow_html=True)
@@ -1450,12 +2862,16 @@ def main() -> None:
         else:
             st.caption("En attente d'une clé API.")
 
-        st.divider()
-        page = st.radio(
-            "Navigation",
-            ["Vue d'ensemble", "Machines", "Harnesses", "Déployer vLLM", "Templates", "Configuration"],
-            label_visibility="collapsed",
-        )
+    pages = ["Vue d'ensemble", "Machines", "Harnesses", "Déployer vLLM", "Templates", "Configuration"]
+    page = st.segmented_control(
+        "Navigation principale",
+        pages,
+        default="Vue d'ensemble",
+        selection_mode="single",
+        key="main_navigation",
+        label_visibility="collapsed",
+        width="stretch",
+    ) or "Vue d'ensemble"
 
     if page == "Vue d'ensemble":
         render_overview(base_url, api_key, account, account_error)
@@ -1468,17 +2884,7 @@ def main() -> None:
     elif page == "Templates":
         render_templates()
     else:
-        st.subheader("Configuration locale")
-        st.write(f"**API utilisée :** `{base_url}`")
-        st.write(
-            "**Clé API :** "
-            + ("préremplie depuis la variable RUNPOD_API_KEY" if env_api_key else "saisie manuellement pour cette session")
-        )
-        st.warning(
-            "La clé Runpod n'est pas écrite dans les templates, le repository ou un fichier de configuration par ce dashboard. "
-            "Les clés vLLM générées sont conservées uniquement dans la session Streamlit : télécharge-les après le déploiement."
-        )
-        st.code("$env:RUNPOD_API_KEY = \"<ta-cle-runpod>\"\nstreamlit run monitoring/runpod/dashboard/app.py", language="powershell")
+        render_configuration(base_url, env_api_key)
 
 
 if __name__ == "__main__":

@@ -96,7 +96,30 @@ La page `Harnesses` surveille automatiquement OpenClaw et Qwen Code toutes les d
 - les modèles retournés par `/v1/models` et leur cohérence avec le modèle du harness ;
 - l'état du Gateway local OpenClaw sur son port configuré.
 
+Chaque carte permet aussi de démarrer le harness dans une nouvelle console Windows ou d'arrêter uniquement ses processus détectés. Le bouton `Options vLLM` accepte un endpoint, une clé et un modèle temporaires, avec redémarrage optionnel pour appliquer immédiatement la connexion. Ces valeurs restent dans la session Streamlit : elles ne modifient ni `openclaw.json`, ni `settings.json`, ni les variables d'environnement Windows.
+
+Pour OpenClaw, l'endpoint et la clé sont injectés via `VLLM_BASE_URL` et `VLLM_API_KEY`; le modèle reste celui déclaré dans `openclaw.json`. Pour Qwen Code, le dashboard transmet `OPENAI_BASE_URL`, `OPENAI_API_KEY` et `OPENAI_MODEL` au nouveau processus.
+
 Les configurations sont lues depuis `%USERPROFILE%\.openclaw\openclaw.json`, `%USERPROFILE%\.qwen\settings.json`, les arguments du processus Qwen Code et les variables `VLLM_BASE_URL`, `VLLM_API_KEY` et `VLLM_MODEL`. Les clés servent uniquement à sonder l'endpoint et ne sont jamais affichées dans l'interface.
+
+### Configurer les modèles et les harnesses
+
+La page `Configuration` centralise les réglages OpenClaw et Qwen Code :
+
+- modèle principal, fallbacks, limite de génération et fenêtre de contexte ;
+- thinking/reasoning, température, top-p et paramètres de compaction ;
+- concurrence, profil d'outils, élévation, approbations et limites des sous-agents ;
+- plugins, skills, extensions et serveurs MCP détectés localement ;
+- catalogue avancé de tous les chemins exposés par le schéma vivant OpenClaw ;
+- catalogue des réglages Qwen Code, y compris les modèles auxiliaires, la télémétrie et les options d'interface.
+
+Les booléens utilisent des interrupteurs, les valeurs bornées des champs numériques et les enums des menus. Le `Fast mode` OpenClaw n'est proposé que pour les fournisseurs/modèles compatibles. Dans Qwen Code, `fastModel` désigne un modèle auxiliaire léger et ne rend pas automatiquement le modèle principal plus rapide.
+
+Les changements OpenClaw passent par `openclaw config patch --stdin`, puis `openclaw config validate`. Qwen Code n'expose pas de commande équivalente : le dashboard écrit `%USERPROFILE%\.qwen\settings.json` de façon atomique et crée une sauvegarde horodatée avant chaque modification d'un fichier existant. Qwen peut ainsi être préconfiguré avant même l'installation du CLI.
+
+Les chemins contenant une clé, un token, un mot de passe, un secret ou des credentials sont exclus de l'explorateur avancé. Le bouton `Actualiser` vide le cache d'inventaire et relit le schéma, les modèles, les plugins et les skills installés.
+
+Références : [configuration OpenClaw](https://docs.openclaw.ai/gateway/configuration), [référence complète OpenClaw](https://docs.openclaw.ai/gateway/configuration-reference) et [settings Qwen Code](https://github.com/QwenLM/qwen-code/blob/main/docs/users/configuration/settings.md).
 
 Les logos locaux du dashboard proviennent des sites officiels [OpenClaw](https://openclaw.ai/) et [Qwen](https://qwenlm.github.io/).
 
