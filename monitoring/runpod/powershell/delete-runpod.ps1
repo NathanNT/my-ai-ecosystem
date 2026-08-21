@@ -3,7 +3,7 @@ param(
     [string]$PodIdentifier,
     [string]$ApiBaseUrl = "https://rest.runpod.io/v1",
     [string]$ApiKey = $env:RUNPOD_API_KEY,
-    [ValidateSet("delete", "terminate")]
+    [ValidateSet("delete", "stop")]
     [string]$Action = "delete",
     [int]$TimeoutSec = 60
 )
@@ -55,12 +55,11 @@ if ($Action -eq "delete") {
         throw "Erreur API lors du delete du pod ${podId}: $($_.Exception.Message)"
     }
 } else {
-    $uri = "$ApiBaseUrl/pods/$podId/terminate"
-    $body = @{ reason = "requested_via_script" } | ConvertTo-Json
+    $uri = "$ApiBaseUrl/pods/$podId/stop"
     try {
-        $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $body -TimeoutSec $TimeoutSec -ErrorAction Stop
+        $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -TimeoutSec $TimeoutSec -ErrorAction Stop
     } catch {
-        throw "Erreur API lors du terminate du pod ${podId}: $($_.Exception.Message)"
+        throw "Erreur API lors du stop du pod ${podId}: $($_.Exception.Message)"
     }
 }
 

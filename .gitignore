@@ -27,6 +27,7 @@ openclaw.json.last-good
 *.attested
 
 # Runtime data
+monitoring/runpod/data/
 *.log
 logs/
 *.sqlite

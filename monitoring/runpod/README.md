@@ -49,13 +49,12 @@ Supprime par nom (si unique) :
 .\powershell\delete-runpod.ps1 -PodIdentifier "my-a40-vllm"
 ```
 
-### 4) Arrêt logique via action terminate
+### 4) Mettre une machine en pause
 
-Selon les droits/versions d'API, le stop réel peut être un `DELETE` ou un `POST /terminate`.
-Le script supporte les deux :
+La pause libère le GPU et conserve le Volume Disk. RunPod facture toujours le stockage du volume tant que le Pod existe : utilise `delete` lorsque tu ne veux plus conserver la machine.
 
 ```powershell
-.\powershell\delete-runpod.ps1 -PodIdentifier 123abc -Action terminate
+.\powershell\delete-runpod.ps1 -PodIdentifier 123abc -Action stop
 ```
 
 ## Dashboard Streamlit (recommandé)
@@ -102,6 +101,14 @@ Pour OpenClaw, l'endpoint et la clé sont injectés via `VLLM_BASE_URL` et `VLLM
 
 Les configurations sont lues depuis `%USERPROFILE%\.openclaw\openclaw.json`, `%USERPROFILE%\.qwen\settings.json`, les arguments du processus Qwen Code et les variables `VLLM_BASE_URL`, `VLLM_API_KEY` et `VLLM_MODEL`. Les clés servent uniquement à sonder l'endpoint et ne sont jamais affichées dans l'interface.
 
+### Pool vLLM multi-agent
+
+When the vLLM pool contains active entries, each harness card exposes a `Depuis le pool vLLM` selector in `Options vLLM`. Select an entry and use `Connecter ce vLLM` to apply its endpoint and the API key from its associated Windows environment variable. Manual entry remains available below the selector. The assignment is temporary and applies only to the current dashboard session.
+
+La page `Harnesses` contient un pool de connexions vLLM. Le bouton `Ajouter` (icône `+`) crée une connexion depuis un Pod RunPod ou un endpoint manuel ; le bouton `Retirer` (icône `-`) retire uniquement son entrée locale. Une connexion associe un endpoint, un modèle, un Pod/GPU optionnel et une variable d'environnement Windows qui contient sa clé API. La clé elle-même n'est jamais écrite dans le catalogue.
+
+Le bouton `Générer les profils OpenClaw` crée ou met à jour un fournisseur OpenAI-compatible et un agent OpenClaw par connexion active. Par exemple, une connexion `qwen-a40` devient le fournisseur `vllm-qwen-a40` et l'agent `agent-qwen-a40`. Cela permet à un même Gateway d'utiliser plusieurs Pods/GPU et modèles distincts. Les connexions sont locales dans `monitoring/runpod/data/vllm-connections.json`, ignorées par Git. Après une synchronisation, redémarre le Gateway si les nouveaux agents n'apparaissent pas immédiatement.
+
 ### Configurer les modèles et les harnesses
 
 La page `Configuration` centralise les réglages OpenClaw et Qwen Code :
@@ -119,13 +126,23 @@ Les changements OpenClaw passent par `openclaw config patch --stdin`, puis `open
 
 Les chemins contenant une clé, un token, un mot de passe, un secret ou des credentials sont exclus de l'explorateur avancé. Le bouton `Actualiser` vide le cache d'inventaire et relit le schéma, les modèles, les plugins et les skills installés.
 
+Pour garder l'interface réactive, le schéma, la liste des modèles et leur statut sont lus en parallèle puis conservés cinq minutes en cache. Les plugins et les skills ne sont demandés que lorsque leur section est ouverte, et sont eux aussi lus en parallèle.
+
 Références : [configuration OpenClaw](https://docs.openclaw.ai/gateway/configuration), [référence complète OpenClaw](https://docs.openclaw.ai/gateway/configuration-reference) et [settings Qwen Code](https://github.com/QwenLM/qwen-code/blob/main/docs/users/configuration/settings.md).
 
 Les logos locaux du dashboard proviennent des sites officiels [OpenClaw](https://openclaw.ai/) et [Qwen](https://qwenlm.github.io/).
 
 Tu peux aussi saisir la clé dans la barre latérale puis cliquer sur `Enregistrer la clé dans Windows`. Elle sera enregistrée comme variable d'environnement utilisateur `RUNPOD_API_KEY` dans Windows. Les nouveaux terminaux et les prochains lancements de Streamlit la récupéreront automatiquement ; la valeur reste stockée localement en clair par Windows comme toute variable d'environnement.
 
-Les templates éditables sont dans `monitoring/runpod/templates/`. Le bouton `terminate` est l'action à privilégier pour arrêter une machine ; `delete` est conservé comme action explicite et demande une confirmation dans l'interface.
+Les templates éditables sont dans `monitoring/runpod/templates/`. Le bouton `Mettre en pause` appelle `POST /pods/{id}/stop` et le bouton `Détruire` appelle `DELETE /pods/{id}`. La destruction demande une confirmation dans l'interface.
+
+### Protection automatique contre la surfacturation
+
+Dans `Machines`, la section `Protection contre la surfacturation` permet de programmer, pour chaque Pod, un délai de pause, un délai de destruction, ou les deux. Les deux délais sont calculés à partir de l'enregistrement de la règle ; si les deux sont utilisés, la destruction doit être postérieure à la pause.
+
+Les règles sont enregistrées hors Git dans `monitoring/runpod/data/pod-lifecycle.json` et ne contiennent aucune clé API. Le dashboard les contrôle toutes les 30 secondes tant qu'il est ouvert. Après un redémarrage, les règles et leurs dates absolues sont relues ; une action échue est demandée immédiatement. Les erreurs RunPod sont mémorisées dans la règle et réessayées au contrôle suivant.
+
+Une pause conserve le Volume Disk mais pas le Container Disk, et peut encore produire des frais de stockage. Une destruction est définitive pour toutes les données hors Network Volume. La protection ne peut évidemment pas déclencher une action pendant que le PC et le dashboard sont complètement arrêtés ; au prochain lancement, elle rattrape l'échéance sans la perdre.
 
 ### Déployer vLLM et récupérer les credentials
 
