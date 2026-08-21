@@ -211,9 +211,70 @@ def credentials_text(credentials: dict[str, str]) -> str:
     return "\n".join(f'{key}="{value}"' for key, value in credentials.items())
 
 
-def show_credentials(pod_id: str, credentials: dict[str, str], key_suffix: str) -> None:
+def vllm_health(pod: dict[str, Any], credentials: dict[str, str] | None) -> dict[str, str]:
+    state = pod_state(pod).upper()
+    if state in {"ERROR", "TERMINATED"}:
+        return {"label": "Hors ligne", "color": "#dc2626", "detail": f"Etat Runpod : {state}"}
+    if state not in {"RUNNING", "READY"}:
+        return {"label": "Demarrage", "color": "#d97706", "detail": f"Le pod est dans l'etat {state}."}
+    if not credentials:
+        return {
+            "label": "Non verifiable",
+            "color": "#d97706",
+            "detail": "La cle vLLM de ce pod n'est pas disponible dans cette session.",
+        }
+
+    try:
+        response = requests.get(
+            f"{credentials['VLLM_BASE_URL'].rstrip('/')}/models",
+            headers={"Authorization": f"Bearer {credentials['VLLM_API_KEY']}"},
+            timeout=5,
+        )
+        if response.ok:
+            return {
+                "label": "Operationnel",
+                "color": "#16a34a",
+                "detail": "vLLM repond correctement sur /v1/models.",
+            }
+        if response.status_code in {401, 403}:
+            return {
+                "label": "Erreur auth",
+                "color": "#dc2626",
+                "detail": f"vLLM repond avec HTTP {response.status_code}.",
+            }
+        return {
+            "label": "Demarrage",
+            "color": "#d97706",
+            "detail": f"L'endpoint repond encore avec HTTP {response.status_code}.",
+        }
+    except (requests.RequestException, KeyError):
+        return {
+            "label": "Hors ligne",
+            "color": "#dc2626",
+            "detail": "L'endpoint vLLM n'est pas joignable pour le moment.",
+        }
+
+
+def status_badge(status: dict[str, str]) -> str:
+    return (
+        '<span style="display:inline-flex;align-items:center;gap:0.4rem;'
+        'padding:0.2rem 0.6rem;border-radius:999px;color:white;'
+        f'background:{status["color"]};font-weight:600;font-size:0.85rem;">'
+        '<span style="width:0.5rem;height:0.5rem;border-radius:50%;background:white;"></span>'
+        f'{status["label"]}</span>'
+    )
+
+
+def show_vllm_status(pod: dict[str, Any], credentials: dict[str, str] | None) -> None:
+    status = vllm_health(pod, credentials)
+    st.markdown(status_badge(status), unsafe_allow_html=True)
+    st.caption(status["detail"])
+
+
+def show_credentials(pod_id: str, credentials: dict[str, str], key_suffix: str, pod: dict[str, Any] | None = None) -> None:
     st.success(f"Identifiants vLLM générés pour le pod {pod_id}.")
     st.info("Le modèle sera téléchargé au premier démarrage de vLLM. Copie ou télécharge ces valeurs maintenant : la clé vLLM reste uniquement dans cette session.")
+    show_vllm_status(pod or {"state": "RUNNING"}, credentials)
     st.code(credentials_text(credentials), language="bash")
     st.download_button(
         "Télécharger les identifiants (.env)",
@@ -339,7 +400,7 @@ def render_vllm_deploy(base_url: str, api_key: str) -> None:
         st.session_state.setdefault("vllm_credentials", {})[pod_id] = credentials
         st.success(f"Déploiement envoyé. Pod : {pod_id}")
         st.caption(f"État initial Runpod : {pod_state(created) if isinstance(created, dict) else 'CREATING'}")
-        show_credentials(pod_id, credentials, "created")
+        show_credentials(pod_id, credentials, "created", created if isinstance(created, dict) else None)
     except (requests.RequestException, RuntimeError, ValueError) as exc:
         message = str(exc)
         if "no instances currently available" in message.lower():
@@ -390,6 +451,20 @@ def render_machines(base_url: str, api_key: str) -> None:
         ]
         st.dataframe(rows, use_container_width=True, hide_index=True)
 
+        st.subheader("Etat des modeles vLLM")
+        credentials_by_pod = st.session_state.get("vllm_credentials", {})
+        for pod in pods:
+            pod_id = str(pod.get("id", ""))
+            status = vllm_health(pod, credentials_by_pod.get(pod_id))
+            status_col, detail_col = st.columns([1, 3])
+            with status_col:
+                st.markdown(
+                    f"**{pod.get('name', pod_id)}**<br>{status_badge(status)}",
+                    unsafe_allow_html=True,
+                )
+            with detail_col:
+                st.caption(status["detail"])
+
         pod_options = {
             f"{pod.get('name', 'sans nom')} · {pod.get('id', '')}": pod.get("id", "")
             for pod in pods
@@ -425,9 +500,15 @@ def render_machines(base_url: str, api_key: str) -> None:
     if credentials:
         st.divider()
         st.subheader("Identifiants vLLM de cette session")
+        pods_by_id = {str(pod.get("id")): pod for pod in pods if pod.get("id")}
         for pod_id, pod_credentials in credentials.items():
             with st.expander(pod_id, expanded=True):
-                show_credentials(pod_id, pod_credentials, f"machine_{pod_id}")
+                show_credentials(
+                    pod_id,
+                    pod_credentials,
+                    f"machine_{pod_id}",
+                    pods_by_id.get(pod_id),
+                )
 
 
 def render_templates() -> None:

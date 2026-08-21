@@ -88,6 +88,8 @@ Dans l'onglet `Déployer vLLM`, choisis d'abord le service `Génération texte` 
 - un token Hugging Face uniquement si le modèle est privé ou soumis à une licence ;
 - un Network Volume ID si tu veux conserver le cache du modèle entre plusieurs pods.
 
+Pour ton cas, la template [qwen3.8-27b-fp8-a40.example.json](./templates/qwen3.8-27b-fp8-a40.example.json) préconfigure `Qwen/Qwen3.8-27B-FP8` sur une A40. La variante FP8 est nécessaire pour tenir dans les 48 GB de mémoire de l'A40 ; le contexte initial est limité à 32K pour laisser de la marge au cache KV et à l'encodeur vision. Le modèle Qwen3.8 est multimodal, mais son API reste compatible OpenAI pour les requêtes texte.
+
 Le dashboard récupère le catalogue GPU Runpod avec l'état de stock, la mémoire et le prix indicatif, puis crée le pod avec l'image officielle `vllm/vllm-openai`, expose le port `8000/http` et démarre l'API OpenAI-compatible. vLLM télécharge automatiquement le modèle au démarrage dans `/workspace/huggingface`.
 
 Pour le service `Transcription vocale`, le modèle par défaut est `openai/whisper-large-v3-turbo`. L'endpoint à utiliser depuis ton application est :
@@ -128,7 +130,9 @@ VLLM_API_KEY=<cle-generee-pour-vllm>
 VLLM_MODEL=<modele-hugging-face>
 ```
 
-Le bouton `Tester /v1/models` permet de vérifier que le téléchargement est terminé et que vLLM répond. La clé vLLM n'est conservée que dans la session Streamlit ; télécharge le fichier `.env` immédiatement après le déploiement.
+Le dashboard affiche aussi un badge d'état vLLM pour chaque machine : `Operationnel` en vert lorsque `/v1/models` répond, `Demarrage` en orange lorsque le pod ou le chargement du modèle est encore en cours, et `Hors ligne` en rouge lorsque l'endpoint ne répond pas ou que l'authentification échoue. Pour les pods existants dont la clé vLLM n'est pas connue par la session, le badge indique `Non verifiable` en orange.
+
+Le bouton `Retester /v1/models` permet de vérifier manuellement que le téléchargement est terminé et que vLLM répond. La clé vLLM n'est conservée que dans la session Streamlit ; télécharge le fichier `.env` immédiatement après le déploiement.
 
 ## Paramètres partagés
 
@@ -153,6 +157,7 @@ monitoring/runpod/
     create-pod-template.example.json
   templates/
     a40-vllm.example.json
+    qwen3.8-27b-fp8-a40.example.json
     vllm-asr-whisper.example.json
 ```
 
