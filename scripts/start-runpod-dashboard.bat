@@ -8,7 +8,7 @@ if not exist ".venv\Scripts\python.exe" (
     if errorlevel 1 goto :error
 )
 
-".venv\Scripts\python.exe" -c "import streamlit, requests" >nul 2>&1
+".venv\Scripts\python.exe" -c "import streamlit, requests, psutil" >nul 2>&1
 if errorlevel 1 (
     echo Des dependances RunPod sont manquantes. Mise a jour en cours...
     call "%~dp0setup-runpod-dashboard.bat"

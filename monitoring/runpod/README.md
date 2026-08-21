@@ -59,6 +59,8 @@ La pause libère le GPU et conserve le Volume Disk. RunPod facture toujours le s
 
 ## Dashboard Streamlit (recommandé)
 
+The `Machines` view refreshes automatically every 15 seconds. While a Pod is starting, it shows its RunPod state, requested state, GPU, image, saved model metadata, hourly cost, endpoint, and the latest lifecycle event. vLLM health is checked as soon as its locally stored API-key variable is available.
+
 Le dashboard local regroupe les machines, les templates JSON et les actions de création, terminaison et suppression dans une seule interface. Il ne stocke pas la clé API.
 
 Depuis la racine du repository :
@@ -85,29 +87,23 @@ Le dashboard utilise un thème sombre local et ouvre sur une vue d'ensemble qui 
 
 La lecture du solde utilise l'API GraphQL RunPod. Avec une clé à permissions restreintes, autorise la lecture du compte et de la facturation ; le pilotage des Pods reste disponible même si les informations financières sont refusées.
 
-### Superviser les harnesses
+### Harness monitoring
 
-La page `Harnesses` surveille automatiquement OpenClaw et Qwen Code toutes les dix secondes. Elle affiche pour chacun :
+The `Harnesses` page refreshes OpenClaw and Qwen Code every ten seconds. Each card shows the active connection, model, endpoint, vLLM health, process uptime, memory usage, and latency. Start, stop, and restart controls operate only on the detected harness processes.
 
-- le nombre de processus locaux, leur mémoire et leur durée d'exécution ;
-- le fichier de configuration détecté et le modèle sélectionné ;
-- l'endpoint vLLM réellement utilisé, son état et sa latence ;
-- les modèles retournés par `/v1/models` et leur cohérence avec le modèle du harness ;
-- l'état du Gateway local OpenClaw sur son port configuré.
+`Options vLLM` separates saved RunPod instances from manual configuration. Selecting a different instance only creates a pending selection; the active connection does not change until `Apply and restart` is used. Before replacing a running harness, the dashboard calls the selected endpoint's `/models` route with the selected API key and verifies that the configured model is served. A failed endpoint, rejected key, or mismatched model prevents the restart.
 
-Chaque carte permet aussi de démarrer le harness dans une nouvelle console Windows ou d'arrêter uniquement ses processus détectés. Le bouton `Options vLLM` accepte un endpoint, une clé et un modèle temporaires, avec redémarrage optionnel pour appliquer immédiatement la connexion. Ces valeurs restent dans la session Streamlit : elles ne modifient ni `openclaw.json`, ni `settings.json`, ni les variables d'environnement Windows.
+RunPod reads are preloaded concurrently and shared across pages. Pod inventory is cached for 15 seconds, account data for 60 seconds, billing for five minutes, GPU availability for 60 seconds, vLLM health for 12 seconds, and the local process inventory for 15 seconds. Manual refreshes and every create, stop, or delete action invalidate the relevant caches immediately. API keys are excluded from Streamlit cache keys; only their SHA-256 fingerprints identify separate cache entries. OpenClaw device-pairing requests are loaded only when their refresh button is used.
 
-Pour OpenClaw, l'endpoint et la clé sont injectés via `VLLM_BASE_URL` et `VLLM_API_KEY`; le modèle reste celui déclaré dans `openclaw.json`. Pour Qwen Code, le dashboard transmet `OPENAI_BASE_URL`, `OPENAI_API_KEY` et `OPENAI_MODEL` au nouveau processus.
-
-Les configurations sont lues depuis `%USERPROFILE%\.openclaw\openclaw.json`, `%USERPROFILE%\.qwen\settings.json`, les arguments du processus Qwen Code et les variables `VLLM_BASE_URL`, `VLLM_API_KEY` et `VLLM_MODEL`. Les clés servent uniquement à sonder l'endpoint et ne sont jamais affichées dans l'interface.
+For OpenClaw, applying an instance updates the explicit `vllm` provider and primary model in `openclaw.json`. The selected per-Pod secret remains in its dedicated Windows variable, while the dashboard synchronizes the active value to both `VLLM_API_KEY` and OpenClaw's higher-priority `vllm:default` auth profile. The key is then injected explicitly into every Gateway process launched by the dashboard. On Windows, harness processes also receive `NODE_USE_SYSTEM_CA=1` so Node.js trusts the Windows certificate store without disabling TLS verification. Qwen Code receives `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `OPENAI_MODEL` in its process environment.
 
 ### Pool vLLM multi-agent
 
-When the vLLM pool contains active entries, each harness card exposes a `Depuis le pool vLLM` selector in `Options vLLM`. Select an entry and use `Connecter ce vLLM` to apply its endpoint and the API key from its associated Windows environment variable. Manual entry remains available below the selector. The assignment is temporary and applies only to the current dashboard session.
+Every text vLLM Pod created from `Déployer vLLM` is automatically registered as a selectable instance. Its endpoint, model, and a dedicated Windows API-key variable are saved locally, outside Git. The `Harnesses` page compares this catalog with the live RunPod inventory: deleted Pods are hidden from selectors and can be removed from the local catalog in one click.
 
-La page `Harnesses` contient un pool de connexions vLLM. Le bouton `Ajouter` (icône `+`) crée une connexion depuis un Pod RunPod ou un endpoint manuel ; le bouton `Retirer` (icône `-`) retire uniquement son entrée locale. Une connexion associe un endpoint, un modèle, un Pod/GPU optionnel et une variable d'environnement Windows qui contient sa clé API. La clé elle-même n'est jamais écrite dans le catalogue.
+In OpenClaw's `Options vLLM`, select one primary instance and zero or more additional instances. The primary instance becomes the default `vllm` model. Each additional instance creates a dedicated provider and agent in `openclaw.json`, with its own environment-backed API key. Applying the selection validates every endpoint and restarts the Gateway when it is already running. Qwen Code supports one vLLM connection per CLI process, so its selector remains single-choice.
 
-Le bouton `Générer les profils OpenClaw` crée ou met à jour un fournisseur OpenAI-compatible et un agent OpenClaw par connexion active. Par exemple, une connexion `qwen-a40` devient le fournisseur `vllm-qwen-a40` et l'agent `agent-qwen-a40`. Cela permet à un même Gateway d'utiliser plusieurs Pods/GPU et modèles distincts. Les connexions sont locales dans `monitoring/runpod/data/vllm-connections.json`, ignorées par Git. Après une synchronisation, redémarre le Gateway si les nouveaux agents n'apparaissent pas immédiatement.
+The local instance catalog is stored in `monitoring/runpod/data/vllm-connections.json` and is ignored by Git. It contains endpoint and model metadata plus the name of the Windows variable that holds the API key; the key itself is never written to the catalog.
 
 ### Configurer les modèles et les harnesses
 
