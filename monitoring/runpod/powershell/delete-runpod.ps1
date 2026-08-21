@@ -52,7 +52,7 @@ if ($Action -eq "delete") {
     try {
         $response = Invoke-RestMethod -Method Delete -Uri $uri -Headers $headers -TimeoutSec $TimeoutSec -ErrorAction Stop
     } catch {
-        throw "Erreur API lors du delete du pod $podId: $($_.Exception.Message)"
+        throw "Erreur API lors du delete du pod ${podId}: $($_.Exception.Message)"
     }
 } else {
     $uri = "$ApiBaseUrl/pods/$podId/terminate"
@@ -60,7 +60,7 @@ if ($Action -eq "delete") {
     try {
         $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $body -TimeoutSec $TimeoutSec -ErrorAction Stop
     } catch {
-        throw "Erreur API lors du terminate du pod $podId: $($_.Exception.Message)"
+        throw "Erreur API lors du terminate du pod ${podId}: $($_.Exception.Message)"
     }
 }
 

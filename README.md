@@ -12,3 +12,5 @@ Resources for setting up my hybrid AI ecosystem, combining local models and mode
 - `scripts/`: Windows-first PowerShell scripts and portable Python automation.
 - `docs/`: architecture and restoration notes.
 - `config/`: shared configuration examples without secrets.
+
+Windows shortcuts are available in `scripts/`: use `start-runpod-dashboard.bat` to launch the RunPod dashboard, `runpod-monitor.bat` to list pods, and `openclaw-status.bat` / `openclaw-gateway.bat` for OpenClaw.
