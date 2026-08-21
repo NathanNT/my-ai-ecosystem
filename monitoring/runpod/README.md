@@ -74,6 +74,8 @@ streamlit run monitoring/runpod/dashboard/app.py
 
 Puis ouvre `http://localhost:8501`.
 
+Depuis l'Explorateur Windows, tu peux aussi double-cliquer sur `scripts\start-runpod-dashboard.bat`. Au premier lancement, le script crée `.venv` et installe automatiquement les dépendances. Pour préparer uniquement l'environnement, utilise `scripts\setup-runpod-dashboard.bat`.
+
 Tu peux aussi saisir la clé dans la barre latérale puis cliquer sur `Enregistrer la clé dans Windows`. Elle sera enregistrée comme variable d'environnement utilisateur `RUNPOD_API_KEY` dans Windows. Les nouveaux terminaux et les prochains lancements de Streamlit la récupéreront automatiquement ; la valeur reste stockée localement en clair par Windows comme toute variable d'environnement.
 
 Les templates éditables sont dans `monitoring/runpod/templates/`. Le bouton `terminate` est l'action à privilégier pour arrêter une machine ; `delete` est conservé comme action explicite et demande une confirmation dans l'interface.
