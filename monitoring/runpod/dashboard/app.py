@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import secrets
+import socket
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,8 +18,10 @@ import streamlit as st
 
 RUNPOD_DIR = Path(__file__).resolve().parents[1]
 TEMPLATES_DIR = RUNPOD_DIR / "templates"
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 DEFAULT_API_BASE_URL = "https://rest.runpod.io/v1"
 VLLM_PORT = 8000
+ACTIVE_POD_STATES = {"RUNNING", "READY", "STARTING", "CREATING"}
 
 
 def api_url(base_url: str, path: str) -> str:
@@ -46,6 +52,59 @@ def request_runpod(
     return response.json()
 
 
+def request_account_summary(api_key: str) -> dict[str, Any]:
+    query = """
+    query DashboardAccount {
+      myself {
+        clientBalance
+        currentSpendPerHr
+        spendLimit
+        underBalance
+        minBalance
+        isAutoPayEnabled
+        stripeAutoPaymentThreshold
+        stripeAutoReloadAmount
+      }
+    }
+    """
+    response = requests.post(
+        "https://api.runpod.io/graphql",
+        params={"api_key": api_key},
+        json={"query": query},
+        timeout=20,
+    )
+    if response.status_code == 401:
+        raise RuntimeError("Runpod API (401) : clé API refusée ou sans accès au compte")
+    if not response.ok:
+        raise RuntimeError(f"Runpod Account API ({response.status_code}) : {response.text[:500]}")
+    body = response.json()
+    if body.get("errors"):
+        details = "; ".join(str(error.get("message", error)) for error in body["errors"])
+        raise RuntimeError(f"Runpod Account API : {details[:500]}")
+    account = body.get("data", {}).get("myself")
+    if not isinstance(account, dict):
+        raise RuntimeError("Réponse de compte Runpod inattendue")
+    return account
+
+
+def request_monthly_pod_billing(base_url: str, api_key: str) -> list[dict[str, Any]]:
+    now = datetime.now(timezone.utc)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    response = request_runpod(
+        "GET",
+        base_url,
+        api_key,
+        "/billing/pods",
+        params={
+            "bucketSize": "day",
+            "grouping": "podId",
+            "startTime": month_start.isoformat().replace("+00:00", "Z"),
+            "endTime": now.isoformat().replace("+00:00", "Z"),
+        },
+    )
+    return response_items(response)
+
+
 def response_items(response: Any) -> list[dict[str, Any]]:
     if isinstance(response, list):
         return response
@@ -58,7 +117,318 @@ def response_items(response: Any) -> list[dict[str, Any]]:
 
 
 def pod_state(pod: dict[str, Any]) -> str:
-    return str(pod.get("state") or pod.get("status") or pod.get("currentStatus") or "unknown")
+    return str(
+        pod.get("state")
+        or pod.get("status")
+        or pod.get("currentStatus")
+        or pod.get("desiredStatus")
+        or "unknown"
+    )
+
+
+def number_value(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def pod_hourly_cost(pod: dict[str, Any]) -> float:
+    return number_value(pod.get("adjustedCostPerHr") or pod.get("costPerHr"))
+
+
+def pod_gpu_name(pod: dict[str, Any]) -> str:
+    gpu = pod.get("gpu")
+    if isinstance(gpu, dict):
+        return str(gpu.get("displayName") or gpu.get("id") or "GPU")
+    return str(pod.get("gpuTypeId") or pod.get("gpuType") or "GPU inconnu")
+
+
+def pod_gpu_count(pod: dict[str, Any]) -> int:
+    gpu = pod.get("gpu")
+    value = gpu.get("count") if isinstance(gpu, dict) else pod.get("gpuCount")
+    try:
+        return max(1, int(value or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def is_active_pod(pod: dict[str, Any]) -> bool:
+    return pod_state(pod).upper() in ACTIVE_POD_STATES
+
+
+def usd(value: Any, suffix: str = "") -> str:
+    return f"${number_value(value):,.2f}{suffix}"
+
+
+def runway_text(balance: float, hourly_spend: float) -> str:
+    if hourly_spend <= 0:
+        return "Aucune dépense"
+    hours = max(0.0, balance / hourly_spend)
+    if hours < 24:
+        return f"{hours:.1f} h"
+    days = hours / 24
+    return f"{days:.1f} j" if days < 30 else f"{days / 30:.1f} mois"
+
+
+def billing_total(records: list[dict[str, Any]]) -> float:
+    return sum(number_value(record.get("amount")) for record in records)
+
+
+def load_json_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def resolve_config_value(value: Any) -> str:
+    if not isinstance(value, str) or not value or value.startswith("<"):
+        return ""
+    expanded = os.path.expandvars(value)
+    if expanded != value:
+        return expanded
+    environment_value = os.getenv(value)
+    if environment_value:
+        return environment_value
+    if value.startswith("${") or (value.startswith("%") and value.endswith("%")):
+        return ""
+    if value.isupper() and "_" in value:
+        return ""
+    return value
+
+
+def scan_harness_processes() -> dict[str, list[dict[str, Any]]]:
+    processes: dict[str, list[dict[str, Any]]] = {"openclaw": [], "qwen-code": []}
+    if os.name != "nt":
+        return processes
+    command = """
+    $items = Get-CimInstance Win32_Process | ForEach-Object {
+      $created = 0
+      if ($_.CreationDate) {
+        $created = ([DateTimeOffset]$_.CreationDate).ToUnixTimeSeconds()
+      }
+      [PSCustomObject]@{
+        pid = $_.ProcessId
+        name = $_.Name
+        commandLine = $_.CommandLine
+        createTime = $created
+        memoryBytes = $_.WorkingSetSize
+      }
+    }
+    @($items) | ConvertTo-Json -Compress
+    """
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+            check=False,
+            creationflags=creation_flags,
+        )
+        values = json.loads(result.stdout) if result.returncode == 0 and result.stdout.strip() else []
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return processes
+    if isinstance(values, dict):
+        values = [values]
+    for info in values if isinstance(values, list) else []:
+        if not isinstance(info, dict):
+            continue
+        name = str(info.get("name") or "")
+        executable = name.lower()
+        command_line = str(info.get("commandLine") or "")
+        command_text = command_line.lower()
+        harness_id = ""
+        if executable.startswith("openclaw") or (
+            executable in {"node", "node.exe"} and "openclaw" in command_text
+        ):
+            harness_id = "openclaw"
+        elif executable.startswith("qwen") or (
+            executable in {"node", "node.exe"} and "qwen-code" in command_text
+        ):
+            harness_id = "qwen-code"
+        if not harness_id:
+            continue
+        processes[harness_id].append(
+            {
+                "pid": int(info.get("pid") or 0),
+                "name": name,
+                "cmdline": command_line.split(),
+                "create_time": number_value(info.get("createTime")),
+                "memory_bytes": int(info.get("memoryBytes") or 0),
+            }
+        )
+    return processes
+
+
+def process_argument(processes: list[dict[str, Any]], flag: str) -> str:
+    for process in processes:
+        command = process.get("cmdline") or []
+        for index, argument in enumerate(command[:-1]):
+            if argument == flag:
+                return str(command[index + 1])
+    return ""
+
+
+def harness_process_metrics(processes: list[dict[str, Any]]) -> dict[str, Any]:
+    if not processes:
+        return {"running": False, "count": 0, "memory_bytes": 0, "started_at": 0.0}
+    start_times = [number_value(process.get("create_time")) for process in processes]
+    return {
+        "running": True,
+        "count": len(processes),
+        "memory_bytes": sum(int(process.get("memory_bytes") or 0) for process in processes),
+        "started_at": min(value for value in start_times if value > 0) if any(start_times) else 0.0,
+    }
+
+
+def openclaw_harness_config(processes: list[dict[str, Any]]) -> dict[str, Any]:
+    config_path = Path.home() / ".openclaw" / "openclaw.json"
+    config = load_json_object(config_path)
+    providers = config.get("models", {}).get("providers", {})
+    provider = providers.get("vllm", {}) if isinstance(providers, dict) else {}
+    if not provider and isinstance(providers, dict):
+        provider = next((value for value in providers.values() if isinstance(value, dict)), {})
+    defaults = config.get("agents", {}).get("defaults", {})
+    primary_model = defaults.get("model", {}).get("primary", "") if isinstance(defaults, dict) else ""
+    gateway = config.get("gateway", {}) if isinstance(config.get("gateway"), dict) else {}
+    raw_api_key = provider.get("apiKey", "") if isinstance(provider, dict) else ""
+    return {
+        "config_path": str(config_path),
+        "configured": bool(config),
+        "base_url": resolve_config_value(provider.get("baseUrl", "")) or os.getenv("VLLM_BASE_URL", ""),
+        "api_key": resolve_config_value(raw_api_key) or os.getenv("VLLM_API_KEY", ""),
+        "model": str(primary_model or os.getenv("VLLM_MODEL", "")),
+        "gateway_port": int(gateway.get("port") or 18789),
+        "processes": processes,
+    }
+
+
+def qwen_harness_config(processes: list[dict[str, Any]]) -> dict[str, Any]:
+    config_path = Path.home() / ".qwen" / "settings.json"
+    config = load_json_object(config_path)
+    model_providers = config.get("modelProviders", {})
+    provider: dict[str, Any] = {}
+    if isinstance(model_providers, dict):
+        for entries in model_providers.values():
+            if isinstance(entries, list):
+                provider = next((entry for entry in entries if isinstance(entry, dict)), {})
+                if provider:
+                    break
+    env_key = str(provider.get("envKey") or "VLLM_API_KEY")
+    return {
+        "config_path": str(config_path),
+        "configured": bool(config),
+        "base_url": process_argument(processes, "--openai-base-url")
+        or resolve_config_value(provider.get("baseUrl", ""))
+        or os.getenv("VLLM_BASE_URL", ""),
+        "api_key": process_argument(processes, "--openai-api-key")
+        or os.getenv(env_key, "")
+        or os.getenv("VLLM_API_KEY", ""),
+        "model": process_argument(processes, "--model")
+        or str(provider.get("id") or os.getenv("VLLM_MODEL", "")),
+        "processes": processes,
+    }
+
+
+def tcp_port_open(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.6):
+            return True
+    except OSError:
+        return False
+
+
+def probe_vllm(base_url: str, api_key: str) -> dict[str, Any]:
+    if not base_url:
+        return {
+            "label": "Non configuré",
+            "color": "#64748b",
+            "detail": "Aucun endpoint vLLM trouvé.",
+            "latency_ms": None,
+            "models": [],
+        }
+    started = datetime.now(timezone.utc)
+    try:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        response = requests.get(f"{base_url.rstrip('/')}/models", headers=headers, timeout=5)
+        latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+        if response.ok:
+            body = response.json()
+            models = [str(item.get("id")) for item in body.get("data", []) if isinstance(item, dict) and item.get("id")]
+            return {
+                "label": "Connecté",
+                "color": "#16a34a",
+                "detail": "L'API vLLM répond sur /v1/models.",
+                "latency_ms": latency_ms,
+                "models": models,
+            }
+        if response.status_code in {401, 403}:
+            return {
+                "label": "Erreur auth",
+                "color": "#dc2626",
+                "detail": f"vLLM répond avec HTTP {response.status_code}.",
+                "latency_ms": latency_ms,
+                "models": [],
+            }
+        return {
+            "label": "Dégradé",
+            "color": "#d97706",
+            "detail": f"vLLM répond avec HTTP {response.status_code}.",
+            "latency_ms": latency_ms,
+            "models": [],
+        }
+    except (requests.RequestException, ValueError):
+        return {
+            "label": "Injoignable",
+            "color": "#dc2626",
+            "detail": "L'endpoint vLLM ne répond pas.",
+            "latency_ms": None,
+            "models": [],
+        }
+
+
+def duration_text(started_at: float) -> str:
+    if started_at <= 0:
+        return "—"
+    seconds = max(0, int(datetime.now().timestamp() - started_at))
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    if days:
+        return f"{days} j {hours} h"
+    if hours:
+        return f"{hours} h {minutes} min"
+    return f"{minutes} min"
+
+
+def memory_text(memory_bytes: int) -> str:
+    return f"{memory_bytes / (1024 * 1024):.0f} MB"
+
+
+def logo_data_uri(filename: str) -> str:
+    path = ASSETS_DIR / filename
+    try:
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    except OSError:
+        return ""
+    return f"data:image/png;base64,{encoded}"
+
+
+def model_alignment(configured_model: str, served_models: list[str]) -> bool | None:
+    if not configured_model or not served_models:
+        return None
+    configured = configured_model.lower().split("/", 1)[-1]
+    return any(
+        configured == served.lower()
+        or configured == served.lower().split("/", 1)[-1]
+        for served in served_models
+    )
 
 
 def pod_identifier(response: Any) -> str:
@@ -348,6 +718,360 @@ def show_credentials(pod_id: str, credentials: dict[str, str], key_suffix: str, 
             st.warning(f"vLLM n'est pas encore joignable : {exc}")
 
 
+def inject_dashboard_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .stApp { background: #0b0f13; }
+        [data-testid="stSidebar"] {
+            background: #10151b;
+            border-right: 1px solid #26313d;
+        }
+        [data-testid="stHeader"] { background: rgba(11, 15, 19, 0.88); }
+        [data-testid="stMetric"] {
+            background: #141a21;
+            border: 1px solid #2a3541;
+            border-radius: 6px;
+            padding: 0.85rem 1rem;
+            min-height: 108px;
+        }
+        [data-testid="stMetricLabel"] { color: #9ba8b5; }
+        [data-testid="stMetricValue"] { color: #f3f6f8; }
+        [data-testid="stDataFrame"] {
+            border: 1px solid #2a3541;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        .stButton > button, .stDownloadButton > button, .stLinkButton > a {
+            border-radius: 6px;
+            min-height: 2.45rem;
+        }
+        .dashboard-kicker {
+            color: #55d6be;
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0;
+            margin-bottom: 0.15rem;
+        }
+        .dashboard-rule {
+            height: 1px;
+            background: #26313d;
+            margin: 0.4rem 0 1.2rem;
+        }
+        .harness-logo {
+            height: 92px;
+            background: #f3f6f8;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0.75rem;
+        }
+        .harness-logo img {
+            max-width: 100%;
+            max-height: 68px;
+            object-fit: contain;
+        }
+        .harness-stat-label {
+            color: #8f9dab;
+            font-size: 0.76rem;
+            margin-bottom: 0.1rem;
+        }
+        .harness-stat-value {
+            color: #eef2f5;
+            font-size: 1rem;
+            font-weight: 650;
+            overflow-wrap: anywhere;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_overview(
+    base_url: str,
+    api_key: str,
+    account: dict[str, Any] | None,
+    account_error: str,
+) -> None:
+    st.subheader("Vue d'ensemble")
+    refresh_col, timestamp_col = st.columns([1, 4])
+    with refresh_col:
+        if st.button("Actualiser", key="refresh_overview"):
+            st.rerun()
+    with timestamp_col:
+        st.caption(f"Dernière lecture : {datetime.now().astimezone().strftime('%H:%M:%S')}")
+
+    if not api_key:
+        st.info("Ajoute ta clé RunPod dans la barre latérale pour charger le compte et les machines.")
+        return
+
+    pods: list[dict[str, Any]] = []
+    billing: list[dict[str, Any]] = []
+    pods_error = ""
+    billing_error = ""
+    try:
+        pods = response_items(request_runpod("GET", base_url, api_key, "/pods"))
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        pods_error = str(exc)
+    try:
+        billing = request_monthly_pod_billing(base_url, api_key)
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        billing_error = str(exc)
+
+    active_pods = [pod for pod in pods if is_active_pod(pod)]
+    running_pods = [pod for pod in pods if pod_state(pod).upper() in {"RUNNING", "READY"}]
+    active_gpu_count = sum(pod_gpu_count(pod) for pod in active_pods)
+    pod_cost_per_hour = sum(pod_hourly_cost(pod) for pod in active_pods)
+    account_available = isinstance(account, dict)
+    balance = number_value((account or {}).get("clientBalance"))
+    account_spend = number_value((account or {}).get("currentSpendPerHr"))
+    hourly_spend = account_spend if account_available else pod_cost_per_hour
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Crédits disponibles", usd(balance) if account_available else "Indisponible")
+    metric_cols[1].metric("Dépense actuelle", usd(hourly_spend, "/h"))
+    metric_cols[2].metric(
+        "Autonomie estimée",
+        runway_text(balance, hourly_spend) if account_available else "Indisponible",
+    )
+    metric_cols[3].metric("Pods actifs", len(active_pods), delta=f"{len(running_pods)} opérationnel(s)")
+
+    detail_cols = st.columns(4)
+    detail_cols[0].metric("Coût projeté / jour", usd(hourly_spend * 24))
+    detail_cols[1].metric("Pods ce mois", usd(billing_total(billing)) if not billing_error else "Indisponible")
+    detail_cols[2].metric("GPU alloués", active_gpu_count)
+    auto_pay = (account or {}).get("isAutoPayEnabled")
+    detail_cols[3].metric("Auto-paiement", "Activé" if auto_pay else "Désactivé" if account_available else "Indisponible")
+
+    if account_error:
+        st.warning(f"Crédits indisponibles : {account_error}")
+    elif account_available:
+        under_balance = bool(account.get("underBalance"))
+        runway_hours = balance / hourly_spend if hourly_spend > 0 else float("inf")
+        if under_balance or runway_hours < 2:
+            st.error("Solde critique : l'autonomie estimée est inférieure à deux heures.")
+        elif runway_hours < 24:
+            st.warning("Solde à surveiller : moins de 24 heures d'autonomie au rythme actuel.")
+
+    if pods_error:
+        st.error(f"Machines indisponibles : {pods_error}")
+    elif active_pods:
+        st.subheader("Charge active")
+        active_rows = [
+            {
+                "Pod": pod.get("name") or pod.get("id", ""),
+                "État": pod_state(pod).upper(),
+                "GPU": f"{pod_gpu_count(pod)} × {pod_gpu_name(pod)}",
+                "Coût / h": usd(pod_hourly_cost(pod)),
+                "Projection / jour": usd(pod_hourly_cost(pod) * 24),
+            }
+            for pod in active_pods
+        ]
+        st.dataframe(active_rows, width="stretch", hide_index=True)
+    else:
+        st.info("Aucun pod actif. Les éventuels volumes persistants peuvent continuer à être facturés.")
+
+    if billing_error:
+        st.caption(f"Historique de facturation indisponible : {billing_error}")
+    elif billing:
+        daily_costs: dict[str, float] = {}
+        pod_costs: dict[str, float] = {}
+        pod_names = {str(pod.get("id")): str(pod.get("name") or pod.get("id")) for pod in pods}
+        for record in billing:
+            day = str(record.get("time", ""))[:10] or "Sans date"
+            pod_id = str(record.get("podId") or "Inconnu")
+            amount = number_value(record.get("amount"))
+            daily_costs[day] = daily_costs.get(day, 0.0) + amount
+            pod_costs[pod_id] = pod_costs.get(pod_id, 0.0) + amount
+
+        chart_rows = [{"Date": day, "Coût ($)": amount} for day, amount in sorted(daily_costs.items())]
+        st.subheader("Dépenses Pods du mois")
+        st.bar_chart(chart_rows, x="Date", y="Coût ($)", width="stretch")
+        cost_rows = [
+            {"Pod": pod_names.get(pod_id, pod_id), "Coût du mois": usd(amount)}
+            for pod_id, amount in sorted(pod_costs.items(), key=lambda item: item[1], reverse=True)
+        ]
+        st.dataframe(cost_rows, width="stretch", hide_index=True)
+
+    if account_available:
+        with st.expander("Paramètres de facturation"):
+            billing_settings = [
+                {
+                    "Paramètre": "Limite de dépense",
+                    "Valeur": usd(account.get("spendLimit"), "/h"),
+                },
+                {
+                    "Paramètre": "Seuil d'auto-paiement",
+                    "Valeur": usd(account.get("stripeAutoPaymentThreshold")),
+                },
+                {
+                    "Paramètre": "Recharge automatique",
+                    "Valeur": usd(account.get("stripeAutoReloadAmount")),
+                },
+                {
+                    "Paramètre": "Solde minimum",
+                    "Valeur": usd(account.get("minBalance")),
+                },
+            ]
+            st.dataframe(billing_settings, width="stretch", hide_index=True)
+
+
+def render_harness_card(
+    harness_id: str,
+    name: str,
+    logo_filename: str,
+    config: dict[str, Any],
+    process_metrics: dict[str, Any],
+    vllm_probe: dict[str, Any],
+) -> None:
+    running = bool(process_metrics.get("running"))
+    gateway_ready = True
+    if harness_id == "openclaw":
+        gateway_ready = tcp_port_open("127.0.0.1", int(config.get("gateway_port") or 18789))
+    alignment = model_alignment(str(config.get("model") or ""), vllm_probe.get("models") or [])
+
+    if not running:
+        overall = {"label": "Arrêté", "color": "#dc2626"}
+    elif not gateway_ready or vllm_probe.get("label") != "Connecté" or alignment is False:
+        overall = {"label": "Dégradé", "color": "#d97706"}
+    else:
+        overall = {"label": "Opérationnel", "color": "#16a34a"}
+
+    with st.container(border=True):
+        logo_col, summary_col = st.columns([1, 4])
+        with logo_col:
+            logo_uri = logo_data_uri(logo_filename)
+            if logo_uri:
+                st.markdown(
+                    f'<div class="harness-logo"><img src="{logo_uri}" alt="{name}"></div>',
+                    unsafe_allow_html=True,
+                )
+        with summary_col:
+            title_col, status_col = st.columns([3, 1])
+            with title_col:
+                st.subheader(name)
+                st.caption(
+                    f"Configuration détectée : {config.get('config_path')}"
+                    if config.get("configured")
+                    else f"Configuration absente : {config.get('config_path')}"
+                )
+            with status_col:
+                st.markdown(status_badge(overall), unsafe_allow_html=True)
+
+        stat_cols = st.columns(5)
+        stats = [
+            ("Processus", str(process_metrics.get("count", 0))),
+            ("En ligne depuis", duration_text(number_value(process_metrics.get("started_at")))),
+            ("Mémoire locale", memory_text(int(process_metrics.get("memory_bytes") or 0))),
+            (
+                "vLLM",
+                str(vllm_probe.get("label") or "Inconnu"),
+            ),
+            (
+                "Latence",
+                f"{vllm_probe['latency_ms']} ms" if vllm_probe.get("latency_ms") is not None else "—",
+            ),
+        ]
+        for column, (label, value) in zip(stat_cols, stats):
+            with column:
+                st.caption(label)
+                st.write(f"**{value}**")
+
+        connection_cols = st.columns([2, 2, 1])
+        with connection_cols[0]:
+            st.caption("Modèle configuré")
+            st.code(str(config.get("model") or "Non renseigné"), language=None)
+        with connection_cols[1]:
+            st.caption("Endpoint vLLM")
+            st.code(str(config.get("base_url") or "Non renseigné"), language=None)
+        with connection_cols[2]:
+            st.caption("Alignement")
+            if alignment is True:
+                st.success("Modèle aligné")
+            elif alignment is False:
+                st.warning("Modèle différent")
+            else:
+                st.info("Non vérifiable")
+
+        if harness_id == "openclaw":
+            gateway_port = int(config.get("gateway_port") or 18789)
+            gateway_status = (
+                {"label": "Gateway connecté", "color": "#16a34a"}
+                if gateway_ready
+                else {"label": "Gateway hors ligne", "color": "#dc2626"}
+            )
+            st.markdown(status_badge(gateway_status), unsafe_allow_html=True)
+            st.caption(f"Gateway local : ws://127.0.0.1:{gateway_port}")
+
+        st.caption(str(vllm_probe.get("detail") or ""))
+        if vllm_probe.get("models"):
+            st.caption("Modèles servis : " + ", ".join(vllm_probe["models"]))
+
+        processes = config.get("processes") or []
+        if processes:
+            with st.expander("Détails des processus"):
+                process_rows = [
+                    {
+                        "PID": process.get("pid"),
+                        "Processus": process.get("name"),
+                        "Démarré à": datetime.fromtimestamp(
+                            number_value(process.get("create_time"))
+                        ).astimezone().strftime("%d/%m/%Y %H:%M:%S"),
+                        "Mémoire": memory_text(int(process.get("memory_bytes") or 0)),
+                    }
+                    for process in processes
+                ]
+                st.dataframe(process_rows, width="stretch", hide_index=True)
+
+
+@st.fragment(run_every=10)
+def render_live_harnesses() -> None:
+    process_groups = scan_harness_processes()
+    harnesses = [
+        (
+            "openclaw",
+            "OpenClaw",
+            "openclaw.png",
+            openclaw_harness_config(process_groups["openclaw"]),
+        ),
+        (
+            "qwen-code",
+            "Qwen Code",
+            "qwen.png",
+            qwen_harness_config(process_groups["qwen-code"]),
+        ),
+    ]
+    probe_cache: dict[tuple[str, str], dict[str, Any]] = {}
+    runtime_rows: list[tuple[str, str, str, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    for harness_id, name, logo, config in harnesses:
+        process_metrics = harness_process_metrics(config.get("processes") or [])
+        probe_key = (str(config.get("base_url") or ""), str(config.get("api_key") or ""))
+        if probe_key not in probe_cache:
+            probe_cache[probe_key] = probe_vllm(*probe_key)
+        runtime_rows.append((harness_id, name, logo, config, process_metrics, probe_cache[probe_key]))
+
+    running_count = sum(1 for row in runtime_rows if row[4].get("running"))
+    connected_count = sum(1 for row in runtime_rows if row[5].get("label") == "Connecté")
+    local_memory = sum(int(row[4].get("memory_bytes") or 0) for row in runtime_rows)
+    overview_cols = st.columns(4)
+    overview_cols[0].metric("Harness actifs", f"{running_count}/{len(runtime_rows)}")
+    overview_cols[1].metric("Connexions vLLM", f"{connected_count}/{len(runtime_rows)}")
+    overview_cols[2].metric("Mémoire locale", memory_text(local_memory))
+    overview_cols[3].metric("Rafraîchissement", "10 s")
+
+    for row in runtime_rows:
+        render_harness_card(*row)
+    st.caption(f"Dernière vérification : {datetime.now().astimezone().strftime('%H:%M:%S')}")
+
+
+def render_harnesses() -> None:
+    st.subheader("Harnesses")
+    st.caption("État local, durée d'exécution et connectivité réelle vers vLLM.")
+    render_live_harnesses()
+
+
 def render_vllm_deploy(base_url: str, api_key: str) -> None:
     st.subheader("Déployer vLLM")
     templates = load_templates()
@@ -539,22 +1263,31 @@ def render_machines(base_url: str, api_key: str) -> None:
     if state_filter != "Tous":
         pods = [pod for pod in pods if pod_state(pod).upper() == state_filter]
 
-    st.metric("Machines visibles", len(pods))
+    machine_metrics = st.columns(3)
+    machine_metrics[0].metric("Machines visibles", len(pods))
+    machine_metrics[1].metric("GPU actifs", sum(pod_gpu_count(pod) for pod in pods if is_active_pod(pod)))
+    machine_metrics[2].metric(
+        "Coût actif",
+        usd(sum(pod_hourly_cost(pod) for pod in pods if is_active_pod(pod)), "/h"),
+    )
     if pods:
         rows = [
             {
                 "Nom": pod.get("name", ""),
                 "ID": pod.get("id", ""),
-                "État": pod_state(pod),
-                "GPU": pod.get("gpuTypeId") or pod.get("gpuType", ""),
-                "Région": pod.get("region", ""),
+                "État": pod_state(pod).upper(),
+                "GPU": f"{pod_gpu_count(pod)} × {pod_gpu_name(pod)}",
+                "Coût / h": usd(pod_hourly_cost(pod)),
+                "Coût / jour": usd(pod_hourly_cost(pod) * 24),
+                "Volume": f"{pod.get('volumeInGb', 0)} GB",
+                "Région": pod.get("region") or pod.get("dataCenterId", ""),
                 "IP publique": pod.get("publicIp", ""),
             }
             for pod in pods
         ]
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
 
-        st.subheader("Etat des modeles vLLM")
+        st.subheader("État des modèles vLLM")
         credentials_by_pod = st.session_state.get("vllm_credentials", {})
         for pod in pods:
             pod_id = str(pod.get("id", ""))
@@ -575,6 +1308,17 @@ def render_machines(base_url: str, api_key: str) -> None:
         }
         selected_label = st.selectbox("Machine à piloter", list(pod_options))
         selected_id = pod_options[selected_label]
+        selected_pod = next((pod for pod in pods if str(pod.get("id")) == str(selected_id)), {})
+        endpoint_col, cost_col = st.columns([3, 1])
+        with endpoint_col:
+            st.text_input(
+                "Endpoint OpenAI-compatible",
+                value=f"{proxy_url(str(selected_id))}/v1",
+                disabled=True,
+                key=f"endpoint_{selected_id}",
+            )
+        with cost_col:
+            st.metric("Coût de la machine", usd(pod_hourly_cost(selected_pod), "/h"))
         action_col, confirm_col = st.columns([1, 3])
         with action_col:
             action = st.selectbox("Action", ["terminate", "delete"], label_visibility="collapsed")
@@ -644,9 +1388,17 @@ def render_templates() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Runpod Control Center", page_icon="⚙️", layout="wide")
-    st.title("Runpod Control Center")
-    st.caption("Dashboard local pour suivre et piloter tes machines Runpod.")
+    st.set_page_config(
+        page_title="RunPod Control Center",
+        page_icon="R",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    inject_dashboard_styles()
+    st.markdown('<div class="dashboard-kicker">LOCAL GPU CONTROL</div>', unsafe_allow_html=True)
+    st.title("RunPod Control Center")
+    st.caption("Infrastructure GPU · coûts · modèles")
+    st.markdown('<div class="dashboard-rule"></div>', unsafe_allow_html=True)
 
     with st.sidebar:
         st.header("Connexion")
@@ -680,16 +1432,42 @@ def main() -> None:
             except (ImportError, OSError) as exc:
                 st.error(f"Impossible d'enregistrer la variable Windows : {exc}")
 
-    machines_tab, vllm_tab, templates_tab, config_tab = st.tabs(
-        ["Machines", "Déployer vLLM", "Templates", "Configuration"]
-    )
-    with machines_tab:
+        account: dict[str, Any] | None = None
+        account_error = ""
+        if api_key:
+            try:
+                account = request_account_summary(api_key)
+            except (requests.RequestException, RuntimeError, ValueError) as exc:
+                account_error = str(exc)
+
+        st.divider()
+        st.subheader("Compte")
+        if account:
+            st.metric("Crédits RunPod", usd(account.get("clientBalance")))
+            st.caption(f"Dépense actuelle : {usd(account.get('currentSpendPerHr'), '/h')}")
+        elif api_key:
+            st.caption("Informations financières indisponibles pour cette clé.")
+        else:
+            st.caption("En attente d'une clé API.")
+
+        st.divider()
+        page = st.radio(
+            "Navigation",
+            ["Vue d'ensemble", "Machines", "Harnesses", "Déployer vLLM", "Templates", "Configuration"],
+            label_visibility="collapsed",
+        )
+
+    if page == "Vue d'ensemble":
+        render_overview(base_url, api_key, account, account_error)
+    elif page == "Machines":
         render_machines(base_url, api_key)
-    with vllm_tab:
+    elif page == "Harnesses":
+        render_harnesses()
+    elif page == "Déployer vLLM":
         render_vllm_deploy(base_url, api_key)
-    with templates_tab:
+    elif page == "Templates":
         render_templates()
-    with config_tab:
+    else:
         st.subheader("Configuration locale")
         st.write(f"**API utilisée :** `{base_url}`")
         st.write(
