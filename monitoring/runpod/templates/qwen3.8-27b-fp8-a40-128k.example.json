@@ -1,0 +1,43 @@
+{
+  "_note": "Template for Qwen3.8-27B-FP8 on one NVIDIA A40 with a 128,000-token vLLM context window. The small margin avoids a KV-cache startup failure at 131,072 tokens. Replace the API key placeholders before sending this payload.",
+  "serviceType": "text",
+  "name": "qwen3.8-27b-fp8-a40-128k",
+  "cloudType": "SECURE",
+  "gpuCount": 1,
+  "gpuTypeIds": [
+    "NVIDIA A40"
+  ],
+  "imageName": "vllm/vllm-openai:latest",
+  "containerDiskInGb": 60,
+  "volumeInGb": 120,
+  "volumeMountPath": "/workspace",
+  "ports": [
+    "8000/http"
+  ],
+  "env": {
+    "MODEL_ID": "Qwen/Qwen3.8-27B-FP8",
+    "HF_HOME": "/workspace/huggingface",
+    "HF_TOKEN": "<optional-hugging-face-token>",
+    "VLLM_API_KEY": "<generate-a-secret>"
+  },
+  "dockerStartCmd": [
+    "--model",
+    "Qwen/Qwen3.8-27B-FP8",
+    "--host",
+    "0.0.0.0",
+    "--port",
+    "8000",
+    "--api-key",
+    "<same-secret-as-VLLM_API_KEY>",
+    "--max-model-len",
+    "128000",
+    "--gpu-memory-utilization",
+    "0.90",
+    "--enforce-eager",
+    "--reasoning-parser",
+    "qwen3",
+    "--enable-auto-tool-choice",
+    "--tool-call-parser",
+    "qwen3_coder"
+  ]
+}

@@ -499,7 +499,8 @@ def run_cli(
 ) -> str:
     executable = executable_path(name)
     command = [executable, *arguments]
-    if Path(executable).suffix.lower() in {".bat", ".cmd"}:
+    suffix = Path(executable).suffix.lower()
+    if suffix in {".bat", ".cmd"}:
         command = [
             os.environ.get("COMSPEC", "cmd.exe"),
             "/d",
@@ -507,6 +508,23 @@ def run_cli(
             "/c",
             subprocess.list2cmdline(command),
         ]
+    elif suffix == ".ps1":
+        script_path = Path(executable)
+        node_executable = script_path.parent / "node.exe"
+        entrypoint = script_path.parent / "node_modules" / "openclaw" / "openclaw.mjs"
+        if script_path.name.lower() == "openclaw.ps1" and node_executable.is_file() and entrypoint.is_file():
+            command = [str(node_executable), str(entrypoint), *arguments]
+        else:
+            command = [
+                windows_powershell_executable(),
+                "-NoLogo",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                executable,
+                *arguments,
+            ]
     result = subprocess.run(
         command,
         input=input_text,
@@ -901,6 +919,12 @@ def render_openclaw_access_panel() -> None:
             disabled=True,
             key="openclaw_access_gateway_url",
         )
+        st.link_button(
+            "Ouvrir l'interface web",
+            access["gateway_url"],
+            icon=":material/open_in_new:",
+            width="stretch",
+        )
         gateway_reference = access["gateway_reference"] or "non disponible"
         st.caption(f"Jeton Gateway : {gateway_reference}")
         reveal_gateway = st.button(
@@ -1116,7 +1140,6 @@ def activate_openclaw_vllm_connection(connection: dict[str, Any]) -> None:
     api_key = user_environment_value(api_key_env)
     if not api_key:
         raise RuntimeError(f"La variable Windows {api_key_env or 'de clé vLLM'} est absente ou vide.")
-    synchronize_openclaw_vllm_auth(api_key)
     config = load_json_object(OPENCLAW_CONFIG_PATH)
     if not config:
         raise RuntimeError(f"Configuration OpenClaw absente ou invalide : {OPENCLAW_CONFIG_PATH}")
@@ -1130,12 +1153,12 @@ def activate_openclaw_vllm_connection(connection: dict[str, Any]) -> None:
     available_models[model_ref] = {}
     set_nested_value(config, "agents.defaults.models", available_models)
     save_json_config(OPENCLAW_CONFIG_PATH, config)
-    run_cli("openclaw", ["config", "validate"], timeout=60)
     load_openclaw_core.clear()
     load_openclaw_models.clear()
     load_openclaw_plugins.clear()
     load_openclaw_skills.clear()
     load_openclaw_extensions.clear()
+    synchronize_openclaw_vllm_auth(api_key)
 
 
 def synchronize_openclaw_vllm_auth(api_key: str) -> None:
@@ -1200,6 +1223,71 @@ def validate_harness_vllm(config: dict[str, Any]) -> None:
         )
 
 
+def validate_harness_launch_config(config: dict[str, Any]) -> None:
+    """Reject only incomplete launch configuration, not an unavailable vLLM endpoint."""
+    base_url = str(config.get("base_url") or "").strip().rstrip("/")
+    api_key = str(config.get("api_key") or "").strip()
+    model = normalized_model_id(config.get("model"))
+    if not base_url or not model:
+        raise RuntimeError("Renseigne un endpoint vLLM et un modèle avant de lancer le harness.")
+    if not api_key:
+        raise RuntimeError("La clé API vLLM active est absente. Sélectionne de nouveau l'instance.")
+
+
+def windows_powershell_executable() -> str:
+    return str(
+        Path(os.environ.get("SystemRoot", r"C:\\Windows"))
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+
+
+def copy_text_to_clipboard(value: str) -> None:
+    if not value:
+        raise RuntimeError("Aucune commande à copier.")
+    if os.name != "nt":
+        raise RuntimeError("La copie de commandes est actuellement disponible uniquement sous Windows.")
+    result = subprocess.run(
+        ["clip.exe"],
+        input=value,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "La copie vers le presse-papiers a échoué.")
+
+
+def powershell_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def harness_start_command(harness_id: str, config: dict[str, Any]) -> str:
+    if harness_id == "openclaw":
+        return "openclaw gateway run --force"
+    base_url = str(config.get("base_url") or "").strip().rstrip("/")
+    model = normalized_model_id(config.get("model"))
+    return "\n".join(
+        part
+        for part in (
+            f"$env:OPENAI_BASE_URL = {powershell_literal(base_url)}" if base_url else "",
+            '$env:OPENAI_API_KEY = $env:VLLM_API_KEY',
+            f"$env:OPENAI_MODEL = {powershell_literal(model)}" if model else "",
+            "qwen --auth-type openai `",
+            "  --model $env:OPENAI_MODEL `",
+            "  --openai-api-key $env:OPENAI_API_KEY `",
+            "  --openai-base-url $env:OPENAI_BASE_URL",
+        )
+        if part
+    )
+
+
 def openclaw_provider_environment() -> dict[str, str]:
     """Resolve environment-backed secrets for generated OpenClaw providers."""
     config = load_json_object(OPENCLAW_CONFIG_PATH)
@@ -1220,7 +1308,7 @@ def openclaw_provider_environment() -> dict[str, str]:
     return environment
 
 
-def start_harness(harness_id: str, config: dict[str, Any]) -> None:
+def start_harness(harness_id: str, config: dict[str, Any]) -> int:
     if os.name != "nt":
         raise RuntimeError("Le pilotage des harnesses est actuellement disponible uniquement sous Windows.")
 
@@ -1233,9 +1321,7 @@ def start_harness(harness_id: str, config: dict[str, Any]) -> None:
     api_key = str(config.get("api_key") or "").strip()
     configured_model = str(config.get("model") or "").strip()
     model = configured_model.split("/", 1)[-1]
-    validate_harness_vllm(config)
-    if harness_id == "openclaw":
-        synchronize_openclaw_vllm_auth(api_key)
+    validate_harness_launch_config(config)
 
     environment = os.environ.copy()
     environment.setdefault("NODE_USE_SYSTEM_CA", "1")
@@ -1257,16 +1343,30 @@ def start_harness(harness_id: str, config: dict[str, Any]) -> None:
         if harness_id == "openclaw"
         else [executable, "--auth-type", "openai"]
     )
-    if Path(executable).suffix.lower() in {".bat", ".cmd"}:
+    suffix = Path(executable).suffix.lower()
+    if suffix in {".bat", ".cmd"}:
         command = [os.environ.get("COMSPEC", "cmd.exe"), "/k", subprocess.list2cmdline(command)]
+    elif suffix == ".ps1":
+        command = [
+            windows_powershell_executable(),
+            "-NoLogo",
+            "-NoProfile",
+            "-NoExit",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            executable,
+            *command[1:],
+        ]
 
-    subprocess.Popen(
+    process = subprocess.Popen(
         command,
         cwd=str(Path.cwd()),
         env=environment,
         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
     )
     scan_harness_processes.clear()
+    return int(process.pid)
 
 
 def stop_harness(processes: list[dict[str, Any]]) -> int:
@@ -1651,6 +1751,24 @@ def template_start_args(template: dict[str, Any] | None) -> list[str]:
     return args
 
 
+def template_context_window(template: dict[str, Any] | None, fallback: int = 16384) -> int:
+    if not template or not isinstance(template.get("dockerStartCmd"), list):
+        return fallback
+    arguments = [str(argument) for argument in template["dockerStartCmd"]]
+    for index, argument in enumerate(arguments):
+        if argument == "--max-model-len" and index + 1 < len(arguments):
+            try:
+                return max(1024, int(arguments[index + 1]))
+            except ValueError:
+                return fallback
+        if argument.startswith("--max-model-len="):
+            try:
+                return max(1024, int(argument.split("=", 1)[1]))
+            except ValueError:
+                return fallback
+    return fallback
+
+
 def template_gpu_ids(template: dict[str, Any] | None) -> list[str]:
     if not template:
         return []
@@ -1878,18 +1996,18 @@ def inject_dashboard_styles() -> None:
             margin: 0.4rem 0 1.2rem;
         }
         .harness-logo {
-            height: 112px;
-            margin-bottom: 1rem;
+            height: 64px;
+            margin-bottom: 0.5rem;
             background: #f3f6f8;
             border-radius: 6px;
             display: flex;
             align-items: center;
             justify-content: center;
-            padding: 0.75rem;
+            padding: 0.45rem;
         }
         .harness-logo img {
             max-width: 100%;
-            max-height: 82px;
+            max-height: 48px;
             object-fit: contain;
         }
         .harness-config-path {
@@ -1900,7 +2018,7 @@ def inject_dashboard_styles() -> None:
         }
         .harness-stat-grid {
             display: grid;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
+            grid-template-columns: repeat(3, minmax(0, 1fr));
             gap: 0;
             margin: 1rem 0 0.9rem;
             border-top: 1px solid #26313d;
@@ -1922,28 +2040,9 @@ def inject_dashboard_styles() -> None:
             font-size: 1.18rem;
             font-weight: 650;
         }
-        .harness-connection-grid {
-            display: grid;
-            grid-template-columns: minmax(180px, 0.8fr) minmax(280px, 2fr) minmax(160px, 0.7fr);
-            gap: 1rem;
-            margin-bottom: 0.85rem;
-        }
-        .harness-connection {
-            min-width: 0;
-        }
-        .harness-connection strong {
-            display: block;
-            color: #f1f5f7;
-            font-size: 0.98rem;
-            line-height: 1.45;
-            overflow-wrap: anywhere;
-        }
         .harness-active-connection {
-            display: grid;
-            grid-template-columns: minmax(180px, 0.75fr) minmax(220px, 1fr) minmax(300px, 1.45fr);
-            gap: 1rem;
             margin: 0.9rem 0 1rem;
-            padding: 1rem 1.1rem;
+            padding: 0.8rem 1rem;
             border-left: 4px solid #35c98b;
             background: #131d24;
         }
@@ -1962,6 +2061,15 @@ def inject_dashboard_styles() -> None:
             line-height: 1.4;
             overflow-wrap: anywhere;
         }
+        .harness-active-connection code,
+        .harness-selection-preview code {
+            display: block;
+            margin-top: 0.35rem;
+            color: #a8d9d0;
+            font-size: 0.82rem;
+            overflow-wrap: anywhere;
+            white-space: normal;
+        }
         .harness-active-connection .active-label {
             color: #57dfaa;
             font-size: 0.77rem;
@@ -1969,9 +2077,6 @@ def inject_dashboard_styles() -> None:
             text-transform: uppercase;
         }
         .harness-selection-preview {
-            display: grid;
-            grid-template-columns: minmax(160px, 0.7fr) minmax(220px, 1fr) minmax(280px, 1.35fr);
-            gap: 1rem;
             margin: 0.65rem 0 0.85rem;
             padding: 0.85rem 0;
             border-top: 1px solid #2d3945;
@@ -1981,8 +2086,6 @@ def inject_dashboard_styles() -> None:
             .harness-stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .harness-stat:nth-child(2) { border-right: 0; }
             .harness-stat:nth-child(-n+2) { border-bottom: 1px solid #26313d; }
-            .harness-connection-grid { grid-template-columns: 1fr; }
-            .harness-active-connection, .harness-selection-preview { grid-template-columns: 1fr; }
         }
         </style>
         """,
@@ -2224,7 +2327,7 @@ def render_harness_card(
             else:
                 st.error(feedback[1])
 
-        action_col, restart_col, options_col = st.columns([1, 1.15, 1.35])
+        action_col, restart_col, copy_col, options_col = st.columns([2.2, 1, 0.45, 1])
         with action_col:
             if st.button(
                 "Arrêter" if running else "Démarrer",
@@ -2238,10 +2341,11 @@ def render_harness_card(
                         stopped = stop_harness(config.get("processes") or [])
                         message = f"Arrêt demandé pour {name} ({stopped} arbre(s) de processus)."
                     else:
-                        start_harness(harness_id, config)
-                        message = f"{name} a été lancé dans une nouvelle console Windows."
+                        launcher_pid = start_harness(harness_id, config)
+                        message = f"{name} a été lancé dans une nouvelle console Windows (PID {launcher_pid})."
+                        if vllm_probe.get("label") != "Connecté":
+                            message += " vLLM n'est pas joignable pour le moment : le harness démarre quand même."
                     st.session_state["harness_feedback"][harness_id] = ("success", message)
-                    time.sleep(0.7)
                 except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                     st.session_state["harness_feedback"][harness_id] = ("error", str(exc))
                 st.rerun()
@@ -2251,18 +2355,24 @@ def render_harness_card(
                 icon=":material/restart_alt:",
                 key=f"harness_restart_{harness_id}",
                 disabled=not running,
+                help="Redémarrer sans attendre que vLLM réponde.",
                 width="stretch",
             ):
                 try:
-                    validate_harness_vllm(config)
+                    validate_harness_launch_config(config)
                     stopped = stop_harness(config.get("processes") or [])
                     time.sleep(0.8)
-                    start_harness(harness_id, config)
+                    launcher_pid = start_harness(harness_id, config)
                     st.session_state["harness_feedback"][harness_id] = (
                         "success",
-                        f"{name} redemarre ({stopped} arbre(s) de processus arretes).",
+                        f"{name} redemarre ({stopped} arbre(s) de processus arretes, PID {launcher_pid}).",
                     )
-                    time.sleep(0.7)
+                    if vllm_probe.get("label") != "Connecté":
+                        st.session_state["harness_feedback"][harness_id] = (
+                            "success",
+                            f"{name} redemarre ({stopped} arbre(s) de processus arretes, PID {launcher_pid}). "
+                            "vLLM n'est pas joignable pour le moment.",
+                        )
                 except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                     st.session_state["harness_feedback"][harness_id] = ("error", str(exc))
                 st.rerun()
@@ -2270,15 +2380,28 @@ def render_harness_card(
             options_key = f"show_harness_options_{harness_id}"
             options_open = bool(st.session_state.get(options_key))
             if st.button(
-                "Masquer" if options_open else "Options vLLM",
+                "Masquer" if options_open else "Options",
                 icon=":material/close:" if options_open else ":material/settings:",
                 key=f"toggle_harness_options_{harness_id}",
+                help="Changer la connexion vLLM ou ajouter des agents OpenClaw.",
                 width="stretch",
             ):
                 st.session_state[options_key] = not options_open
                 st.rerun()
+        with copy_col:
+            if st.button(
+                "",
+                icon=":material/content_copy:",
+                key=f"copy_harness_start_{harness_id}",
+                help="Copier la commande PowerShell de démarrage.",
+                width="stretch",
+            ):
+                try:
+                    copy_text_to_clipboard(harness_start_command(harness_id, config))
+                    st.toast("Commande de démarrage copiée.", icon=":material/content_copy:")
+                except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                    st.error(str(exc))
         stats = [
-            ("Processus", str(process_metrics.get("count", 0))),
             ("En ligne depuis", duration_text(number_value(process_metrics.get("started_at")))),
             ("Mémoire locale", memory_text(int(process_metrics.get("memory_bytes") or 0))),
             ("Latence vLLM", f"{vllm_probe['latency_ms']} ms" if vllm_probe.get("latency_ms") is not None else "—"),
@@ -2296,18 +2419,15 @@ def render_harness_card(
         active_markup = (
             '<div class="harness-active-connection">'
             '<div><span class="active-label">'
-            f'{html.escape(active_label)}</span><strong>{html.escape(active_source)}</strong></div>'
-            '<div><span>Modèle</span>'
-            f'<strong>{html.escape(str(config.get("model") or "Non renseigné"))}</strong></div>'
-            '<div><span>Endpoint vLLM</span>'
-            f'<strong>{html.escape(str(config.get("base_url") or "Non renseigné"))}</strong></div>'
+            f'{html.escape(active_label)}</span><strong>{html.escape(active_source)} · '
+            f'{html.escape(str(config.get("model") or "Modèle non renseigné"))}</strong>'
+            f'<code>{html.escape(str(config.get("base_url") or "Endpoint vLLM non renseigné"))}</code></div>'
             "</div>"
         )
         st.markdown(active_markup, unsafe_allow_html=True)
         st.caption(
             f"État vLLM : {vllm_probe.get('label') or 'Inconnu'} · {alignment_label}"
         )
-
         options_key = f"show_harness_options_{harness_id}"
         if st.session_state.get(options_key):
             st.markdown("#### Changer la connexion vLLM")
@@ -2335,7 +2455,7 @@ def render_harness_card(
                         if not value
                         else
                         f"{connection_by_id[value].get('name') or value} "
-                        f"- {str(connection_by_id[value].get('podId') or value)[-6:]} "
+                        f"- Pod {str(connection_by_id[value].get('podId') or value)} "
                         f"- {connection_by_id[value].get('model') or 'modèle non renseigné'}"
                     ),
                     key=f"pool_connection_choice_v2_{harness_id}",
@@ -2358,23 +2478,26 @@ def render_harness_card(
                             for connection_id in additional_options
                             if connection_id in configured_additional_ids
                         ]
-                        st.markdown("##### Agents supplémentaires")
-                        st.caption(
-                            "Chaque instance supplémentaire crée un agent OpenClaw dédié. "
-                            "L'instance principale reste le modèle utilisé par défaut."
-                        )
-                        selected_additional_ids = st.multiselect(
-                            "Instances vLLM supplémentaires",
-                            options=additional_options,
-                            default=default_additional_ids,
-                            format_func=lambda value: (
-                                f"{connection_by_id[value].get('name') or value} "
-                                f"- {str(connection_by_id[value].get('podId') or value)[-6:]} "
-                                f"- {connection_by_id[value].get('model') or 'modèle non renseigné'}"
-                            ),
-                            key=f"openclaw_additional_vllm_v1_{selected_pool_id}",
-                            placeholder="Ajouter une ou plusieurs instances",
-                        )
+                        with st.expander(
+                            "Multi-agent OpenClaw",
+                            expanded=bool(default_additional_ids),
+                        ):
+                            st.caption(
+                                "Chaque instance supplémentaire crée un agent dédié. "
+                                "L'instance principale reste le modèle utilisé par défaut."
+                            )
+                            selected_additional_ids = st.multiselect(
+                                "Instances supplémentaires",
+                                options=additional_options,
+                                default=default_additional_ids,
+                                format_func=lambda value: (
+                                    f"{connection_by_id[value].get('name') or value} "
+                                    f"- Pod {str(connection_by_id[value].get('podId') or value)} "
+                                    f"- {connection_by_id[value].get('model') or 'modèle non renseigné'}"
+                                ),
+                                key=f"openclaw_additional_vllm_v1_{selected_pool_id}",
+                                placeholder="Ajouter une ou plusieurs instances",
+                            )
                         additional_connections = [
                             connection_by_id[connection_id]
                             for connection_id in selected_additional_ids
@@ -2398,12 +2521,10 @@ def render_harness_card(
                         st.warning("Sélection en attente : rien ne change avant de cliquer sur Appliquer.")
                     selection_markup = (
                         '<div class="harness-selection-preview">'
-                        '<div><span>Pod</span>'
-                        f'<strong>{html.escape(str(selected_connection.get("podId") or selected_pool_id))}</strong></div>'
-                        '<div><span>Modèle sélectionné</span>'
-                        f'<strong>{html.escape(str(selected_connection.get("model") or "Non renseigné"))}</strong></div>'
-                        '<div><span>Endpoint sélectionné</span>'
-                        f'<strong>{html.escape(str(selected_connection.get("baseUrl") or "Non renseigné"))}</strong></div>'
+                        '<span>Instance sélectionnée</span>'
+                        f'<strong>{html.escape(str(selected_connection.get("model") or "Modèle non renseigné"))} '
+                        f'· Pod {html.escape(str(selected_connection.get("podId") or selected_pool_id))}</strong>'
+                        f'<code>{html.escape(str(selected_connection.get("baseUrl") or "Endpoint non renseigné"))}</code>'
                         "</div>"
                     )
                     st.markdown(selection_markup, unsafe_allow_html=True)
@@ -2885,7 +3006,13 @@ def render_vllm_connection_pool(base_url: str, api_key: str) -> None:
         )
         context_col, token_col = st.columns(2)
         with context_col:
-            context_window = st.number_input("Fenêtre de contexte", min_value=1024, value=131072, step=1024)
+            context_window = st.number_input(
+                "Fenêtre de contexte",
+                min_value=1024,
+                value=16384,
+                step=1024,
+                help="Doit correspondre à --max-model-len du serveur vLLM.",
+            )
         with token_col:
             max_tokens = st.number_input("Tokens générés maximum", min_value=128, value=4096, step=128)
         enabled = st.toggle("Connexion active", value=True)
@@ -2995,7 +3122,10 @@ def render_vllm_deploy(base_url: str, api_key: str) -> None:
         help="Les GPU sélectionnés sont envoyés à Runpod dans cet ordre. Leur disponibilité est récupérée en direct.",
     )
     selected_gpu_ids = [gpu_options[label] for label in selected_gpu_labels]
+    configured_context_window = template_context_window(selected_template)
     st.caption("Les prix et états affichés proviennent du catalogue Runpod au moment du chargement.")
+    if service_type == "text":
+        st.caption(f"Contexte vLLM du template : {configured_context_window:,} tokens.")
 
     with st.form("vllm_deploy_form"):
         name = st.text_input(
@@ -3094,6 +3224,8 @@ def render_vllm_deploy(base_url: str, api_key: str) -> None:
                         "baseUrl": credentials["VLLM_BASE_URL"],
                         "model": model.strip(),
                         "apiKeyEnv": api_key_env,
+                        "contextWindow": configured_context_window,
+                        "maxTokens": min(4096, max(128, configured_context_window // 4)),
                         "enabled": True,
                     },
                 )

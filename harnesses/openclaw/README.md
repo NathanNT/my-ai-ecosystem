@@ -129,7 +129,73 @@ Check the result with:
 openclaw gateway status
 ```
 
+### Open the Web Control UI
+
+Open the authenticated local Control UI with:
+
+```powershell
+openclaw dashboard
+```
+
+If the Gateway is not running yet and you want OpenCLAW to start or install it when needed, use:
+
+```powershell
+openclaw dashboard --yes
+```
+
+The local dashboard also exposes an `Ouvrir l'interface web` button in the OpenCLAW Harness card. It opens the configured Gateway URL directly; `openclaw dashboard` is preferable when the browser still needs Gateway authentication.
+
 Only start, stop, restart, or install services intentionally. For a future restore workflow, prefer documenting the exact command sequence before automating it.
+
+## Add an MCP Server
+
+MCP servers are connected to the OpenCLAW Gateway, not to vLLM or the RunPod Pod. Use the Control UI at `http://127.0.0.1:18789/settings/mcp` for an inventory and editor, or use the commands below for a deterministic setup without asking an agent to modify its own configuration.
+
+### Connect the IDA MCP Server
+
+First confirm that the Windows machine can reach the server:
+
+```powershell
+Test-NetConnection 192.168.196.128 -Port 8745
+```
+
+For an IDA MCP server exposing Streamable HTTP at `/mcp`, add it with:
+
+```powershell
+openclaw mcp add ida --url "http://192.168.196.128:8745/mcp" --transport streamable-http --connect-timeout 10 --timeout 30
+openclaw mcp doctor ida --probe
+```
+
+If the IDA server instead exposes Server-Sent Events, use its exact SSE path and transport. Do not configure both variants under the same name:
+
+```powershell
+openclaw mcp add ida --url "http://192.168.196.128:8745/sse" --transport sse --connect-timeout 10 --timeout 30
+openclaw mcp doctor ida --probe
+```
+
+`doctor --probe` is the important step: it opens a real MCP connection and lists the server capabilities. If it fails, the issue is the address, path, transport, firewall, or the IDA MCP process itself, rather than the model.
+
+Inspect or remove the saved definition with:
+
+```powershell
+openclaw mcp show ida --json
+openclaw mcp status --verbose
+openclaw mcp unset ida
+```
+
+When the Gateway runs as a managed Windows service, reload the MCP runtime with a graceful restart:
+
+```powershell
+openclaw gateway restart --safe
+```
+
+When it runs in a foreground terminal, stop that terminal with `Ctrl+C`, then start it again:
+
+```powershell
+openclaw gateway run --force
+```
+
+An MCP definition can be saved while disabled or excluded by the agent tool policy. Confirm the `bundle-mcp` plugin, or the specific `ida__*` tools, are allowed for the agent that should use it.
 
 ## Runpod And vLLM Notes
 

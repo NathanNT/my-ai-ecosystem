@@ -9,6 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+DEFAULT_VLLM_CONTEXT_WINDOW = 16384
+DEFAULT_VLLM_MAX_TOKENS = 4096
+
 
 def utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -45,8 +48,8 @@ def upsert_connection(store: dict[str, Any], connection: dict[str, Any]) -> dict
         "baseUrl": str(connection.get("baseUrl") or "").strip().rstrip("/"),
         "model": str(connection.get("model") or "").strip(),
         "apiKeyEnv": str(connection.get("apiKeyEnv") or f"VLLM_{connection_id.upper().replace('-', '_')}_API_KEY").strip(),
-        "contextWindow": max(1024, int(connection.get("contextWindow") or 131072)),
-        "maxTokens": max(128, int(connection.get("maxTokens") or 4096)),
+        "contextWindow": max(1024, int(connection.get("contextWindow") or DEFAULT_VLLM_CONTEXT_WINDOW)),
+        "maxTokens": max(128, int(connection.get("maxTokens") or DEFAULT_VLLM_MAX_TOKENS)),
         "enabled": bool(connection.get("enabled", True)),
         "createdAt": str(connection.get("createdAt") or now),
         "updatedAt": now,
